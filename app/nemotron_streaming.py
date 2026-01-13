@@ -6,17 +6,29 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+
 def safe_text(h: Any) -> str:
+    """
+    Robust extraction for NeMo outputs (Hypothesis / str / list / None).
+    Never throws, always returns a string.
+    """
     if h is None:
         return ""
     if isinstance(h, str):
         return h
+    # sometimes texts is like [Hypothesis(...)] or nested
+    if isinstance(h, (list, tuple)) and len(h) > 0:
+        return safe_text(h[0])
     if hasattr(h, "text"):
         try:
             return h.text or ""
         except Exception:
             return ""
-    return str(h)
+    try:
+        return str(h)
+    except Exception:
+        return ""
+
 
 @dataclass
 class StreamTimings:
@@ -24,11 +36,13 @@ class StreamTimings:
     infer_sec: float = 0.0
     flush_sec: float = 0.0
 
+
 class NemotronStreamingASR:
     """
     True streaming ASR using NeMo's conformer_stream_step().
     Avoids calling model.transcribe() repeatedly (which is slow + noisy).
     """
+
     def __init__(self, model_name: str, device: str, sample_rate: int, context_right: int):
         self.model_name = model_name
         self.device = device
@@ -42,6 +56,28 @@ class NemotronStreamingASR:
         self.pre_cache_frames: int = 0
         self.hop_samples: int = 0
         self.drop_extra: int = 0
+
+        # helpful derived values
+        self._frame_stride_sec: float = 0.01  # default; overwritten at load
+
+    @property
+    def chunk_samples(self) -> int:
+        """
+        Approx audio samples consumed per streaming step.
+        shift_frames * hop_samples is a good approximation.
+        """
+        if self.shift_frames <= 0 or self.hop_samples <= 0:
+            return int(0.08 * self.sr)  # safe fallback 80ms
+        return int(self.shift_frames * self.hop_samples)
+
+    def _to_device(self, x: torch.Tensor) -> torch.Tensor:
+        if self.device == "cuda":
+            return x.cuda(non_blocking=True)
+        return x.cpu()
+
+    def _move_cache_to_device(self, cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        c0, c1, c2 = cache
+        return (self._to_device(c0), self._to_device(c1), self._to_device(c2))
 
     def load(self):
         import nemo.collections.asr as nemo_asr
@@ -60,7 +96,12 @@ class NemotronStreamingASR:
             self.model = self.model.cpu()
 
         # streaming attention context
-        self.model.encoder.set_default_att_context_size([70, int(self.context_right)])
+        # keep your logic intact
+        try:
+            self.model.encoder.set_default_att_context_size([70, int(self.context_right)])
+        except Exception:
+            # some NeMo variants accept tuple
+            self.model.encoder.set_default_att_context_size((70, int(self.context_right)))
 
         # IMPORTANT: disable cuda-graph decoder to avoid "CUDA failure 35" / fallback spam
         self.model.change_decoding_strategy(
@@ -87,20 +128,31 @@ class NemotronStreamingASR:
         self.pre_cache_frames = pre_cache[1] if isinstance(pre_cache, (list, tuple)) else pre_cache
         self.drop_extra = int(getattr(scfg, "drop_extra_pre_encoded", 0))
 
-        # hop size in samples
-        hop_sec = float(self.model.cfg.preprocessor.get("window_stride", 0.01))
-        self.hop_samples = int(hop_sec * self.sr)
+        # hop size in samples (audio->feature stride)
+        self._frame_stride_sec = float(self.model.cfg.preprocessor.get("window_stride", 0.01))
+        self.hop_samples = int(self._frame_stride_sec * self.sr)
 
-        # warmup streaming kernels
+        # warmup streaming kernels (FIXED)
         self._warmup()
 
         return time.time() - t0
 
     @torch.inference_mode()
     def _warmup(self):
-        # 1 second silence warmup
-        warm = np.zeros(int(self.sr * 1.0), dtype=np.float32)
-        _ = self.stream_transcribe(warm, reset_state=True, force_flush=True)
+        """
+        ✅ FIX: Warmup using the real StreamingSession path.
+        Older code sometimes called stream_transcribe() with wrong args.
+        """
+        try:
+            sess = self.new_session(max_buffer_ms=3000)
+            silence = np.zeros(int(self.sr * 1.0), dtype=np.float32)
+            # Feed as pcm16-like float32 (convert back to pcm16 bytes)
+            pcm16 = (np.clip(silence, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            sess.accept_pcm16(pcm16)
+            _ = sess.finalize(pad_ms=400)
+        except Exception:
+            # Warmup should never crash startup
+            pass
 
     def new_session(self, max_buffer_ms: int):
         return StreamingSession(self, max_buffer_ms=max_buffer_ms)
@@ -125,8 +177,7 @@ class NemotronStreamingASR:
         # preprocess all current buffer
         t0 = time.perf_counter()
         audio_tensor = torch.from_numpy(audio_f32).unsqueeze(0)
-        if self.device == "cuda":
-            audio_tensor = audio_tensor.cuda()
+        audio_tensor = self._to_device(audio_tensor)
         audio_len = torch.tensor([len(audio_f32)], device=audio_tensor.device)
         mel, mel_len = self.model.preprocessor(input_signal=audio_tensor, length=audio_len)
         timings.preproc_sec += (time.perf_counter() - t0)
@@ -155,6 +206,9 @@ class NemotronStreamingASR:
         chunk_mel = mel[:, :, chunk_start:chunk_end]
         chunk_len = torch.tensor([chunk_mel.shape[-1]], device=chunk_mel.device)
 
+        # ensure cache on correct device
+        cache = self._move_cache_to_device(cache)
+
         # infer step
         t1 = time.perf_counter()
         (prev_pred_out, texts, cache0, cache1, cache2, prev_hyp) = self.model.conformer_stream_step(
@@ -177,8 +231,8 @@ class NemotronStreamingASR:
             emitted_frames = min(emitted_frames + self.shift_frames, available)
 
         text = ""
-        if texts and texts[0] is not None:
-            text = safe_text(texts[0]).strip()
+        if texts is not None:
+            text = safe_text(texts).strip()
 
         return text, new_cache, prev_hyp, prev_pred_out, emitted_frames, timings
 
@@ -188,6 +242,7 @@ class StreamingSession:
     Holds per-websocket streaming state.
     Maintains ring buffer so preprocessing cost doesn't grow unbounded.
     """
+
     def __init__(self, engine: NemotronStreamingASR, max_buffer_ms: int):
         self.engine = engine
         self.max_buffer_samples = int(engine.sr * (max_buffer_ms / 1000.0))
@@ -211,12 +266,16 @@ class StreamingSession:
         self.utt_flush = 0.0
         self.chunks = 0
 
+        # track trimming to prevent emitted_frames desync
+        self._trimmed_since_last_step = False
+
         self.reset_stream_state()
 
     def reset_stream_state(self):
         # initial cache state
         cache = self.engine.model.encoder.get_initial_cache_state(batch_size=1)
-        self.cache = (cache[0], cache[1], cache[2])
+        self.cache = self.engine._move_cache_to_device((cache[0], cache[1], cache[2]))
+
         self.prev_hyp = None
         self.prev_pred = None
         self.emitted_frames = 0
@@ -229,17 +288,32 @@ class StreamingSession:
         self.utt_flush = 0.0
         self.chunks = 0
 
+        self._trimmed_since_last_step = False
+
     def accept_pcm16(self, pcm16: bytes):
         x = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
         self.audio = np.concatenate([self.audio, x])
+
         # bound audio buffer
         if len(self.audio) > self.max_buffer_samples:
             self.audio = self.audio[-self.max_buffer_samples:]
+            # ✅ IMPORTANT: trimming breaks alignment with emitted_frames -> protect accuracy
+            self._trimmed_since_last_step = True
 
     def backlog_ms(self) -> int:
         return int(1000 * (len(self.audio) / self.engine.sr))
 
     def step_if_ready(self) -> Optional[str]:
+        # ✅ If buffer trimmed, safest is to reset stream cache alignment (prevents missing words)
+        if self._trimmed_since_last_step and self.emitted_frames > 0:
+            # keep already-produced text, but reset streaming state to realign
+            self.cache = self.engine.model.encoder.get_initial_cache_state(batch_size=1)
+            self.cache = self.engine._move_cache_to_device((self.cache[0], self.cache[1], self.cache[2]))
+            self.prev_hyp = None
+            self.prev_pred = None
+            self.emitted_frames = 0
+            self._trimmed_since_last_step = False
+
         text, self.cache, self.prev_hyp, self.prev_pred, self.emitted_frames, t = self.engine.stream_transcribe(
             audio_f32=self.audio,
             cache=self.cache,
@@ -282,7 +356,7 @@ class StreamingSession:
 
         final = self.current_text.strip()
 
-        # reset for next utterance but keep last_final_text
+        # keep last_final_text accumulation
         self.last_final_text = (self.last_final_text + " " + final).strip() if final else self.last_final_text
 
         # hard reset state (fresh caches)
