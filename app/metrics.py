@@ -1,20 +1,22 @@
 from prometheus_client import Counter, Histogram, Gauge
 
-ACTIVE_STREAMS = Gauge("asr_active_streams", "Active streams")
-PARTIALS_TOTAL = Counter("asr_partials_total", "Partials")
-FINALS_TOTAL = Counter("asr_finals_total", "Finals")
-UTTERANCES_TOTAL = Counter("asr_utterances_total", "Utterances")
+ACTIVE_STREAMS = Gauge("asr_active_streams", "Active websocket streams")
 
-TTFT_WALL = Histogram("asr_ttft_wall_sec", "TTFT")
-TTF_WALL = Histogram("asr_ttf_wall_sec", "TTF")
-INFER_SEC = Histogram("asr_infer_sec", "Infer time")
-QUEUE_WAIT = Histogram("asr_queue_wait_sec", "GPU wait")
+PARTIALS_TOTAL = Counter("asr_partials_total", "Partial messages sent")
+FINALS_TOTAL = Counter("asr_finals_total", "Final messages sent")
+UTTERANCES_TOTAL = Counter("asr_utterances_total", "Utterances finalized")
 
-AUDIO_SEC = Histogram("asr_audio_sec", "Audio seconds")
-RTF = Histogram("asr_rtf", "RTF")
+TTFT_WALL = Histogram("asr_ttft_wall_sec", "Wall TTFT seconds")
+TTF_WALL  = Histogram("asr_ttf_wall_sec", "Wall TTF seconds")
 
-BACKLOG_MS = Gauge("asr_backlog_ms", "Backlog ms")
+QUEUE_WAIT = Histogram("asr_queue_wait_sec", "GPU semaphore wait seconds")
+INFER_SEC  = Histogram("asr_infer_sec", "Model inference seconds")
 
-GPU_UTIL = Gauge("asr_gpu_util", "GPU util")
-GPU_MEM_USED_MB = Gauge("asr_gpu_mem_used_mb", "GPU mem used")
-GPU_MEM_TOTAL_MB = Gauge("asr_gpu_mem_total_mb", "GPU mem total")
+AUDIO_SEC = Histogram("asr_audio_sec", "Audio seconds per utterance")
+RTF       = Histogram("asr_rtf", "Real-time factor")
+
+BACKLOG_MS = Gauge("asr_backlog_ms", "Buffered audio backlog (ms)")
+
+GPU_UTIL = Gauge("asr_gpu_util", "GPU utilization percent")
+GPU_MEM_USED_MB = Gauge("asr_gpu_mem_used_mb", "GPU memory used MB")
+GPU_MEM_TOTAL_MB = Gauge("asr_gpu_mem_total_mb", "GPU memory total MB")

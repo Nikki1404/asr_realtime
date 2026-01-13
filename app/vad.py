@@ -1,35 +1,51 @@
-import numpy as np
 from collections import deque
+import numpy as np
 
 class AdaptiveEnergyVAD:
-    def __init__(self, sr, frame_ms, margin, min_rms, pre_ms):
-        self.sr = sr
+    """
+    Adaptive noise-floor VAD:
+      - Maintains a running noise RMS estimate when not in speech
+      - Speech if RMS > noise_rms * start_margin (with a minimum noise RMS)
+    """
+    def __init__(self, sample_rate: int, frame_ms: int, start_margin: float, min_noise_rms: float, pre_speech_ms: int):
+        self.sr = sample_rate
         self.frame_ms = frame_ms
-        self.margin = margin
-        self.min_rms = min_rms
-        self.frame_samples = int(sr * frame_ms / 1000)
-        self.frame_bytes = self.frame_samples * 2
-        self.pre_frames = int(pre_ms / frame_ms)
-        self.ring = deque(maxlen=self.pre_frames)
-        self.noise = min_rms
-        self.in_speech = False
+        self.start_margin = start_margin
+        self.min_noise_rms = min_noise_rms
 
-    def rms(self, pcm):
-        x = np.frombuffer(pcm, np.int16).astype("float32") / 32768
-        return float(np.sqrt((x*x).mean() + 1e-12))
+        self.frame_samples = int(self.sr * self.frame_ms / 1000)
+        self.frame_bytes = self.frame_samples * 2
+
+        self.pre_frames = max(1, int(pre_speech_ms / frame_ms))
+        self.ring = deque(maxlen=self.pre_frames)
+
+        self.in_speech = False
+        self.noise_rms = min_noise_rms  # start guess
 
     def reset(self):
         self.ring.clear()
         self.in_speech = False
 
-    def push(self, frame):
-        e = self.rms(frame)
+    def _rms(self, pcm16: bytes) -> float:
+        x = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        return float(np.sqrt(np.mean(x * x) + 1e-12))
+
+    def push_frame(self, frame_pcm16: bytes):
+        e = self._rms(frame_pcm16)
+
+        # Update noise floor when not in speech (EMA)
         if not self.in_speech:
-            self.noise = max(self.min_rms, 0.95*self.noise + 0.05*e)
-        speech = e > self.noise * self.margin
-        self.ring.append(frame)
-        pre = None
-        if speech and not self.in_speech:
+            alpha = 0.95
+            self.noise_rms = max(self.min_noise_rms, alpha * self.noise_rms + (1 - alpha) * e)
+
+        th = max(self.min_noise_rms, self.noise_rms) * self.start_margin
+        is_speech = e >= th
+
+        self.ring.append(frame_pcm16)
+
+        pre_roll = None
+        if (not self.in_speech) and is_speech:
             self.in_speech = True
-            pre = b"".join(self.ring)
-        return speech, pre
+            pre_roll = b"".join(self.ring)
+
+        return is_speech, pre_roll
