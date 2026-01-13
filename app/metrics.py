@@ -10,7 +10,9 @@ TTFT_WALL = Histogram("asr_ttft_wall_sec", "Wall TTFT seconds")
 TTF_WALL  = Histogram("asr_ttf_wall_sec", "Wall TTF seconds")
 
 QUEUE_WAIT = Histogram("asr_queue_wait_sec", "GPU semaphore wait seconds")
-INFER_SEC  = Histogram("asr_infer_sec", "Model inference seconds")
+PREPROC_SEC = Histogram("asr_preproc_sec", "Preprocessor seconds")
+INFER_SEC   = Histogram("asr_infer_sec", "Streaming infer seconds")
+FLUSH_SEC   = Histogram("asr_flush_sec", "Final flush seconds")
 
 AUDIO_SEC = Histogram("asr_audio_sec", "Audio seconds per utterance")
 RTF       = Histogram("asr_rtf", "Real-time factor")

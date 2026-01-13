@@ -3,11 +3,12 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 WORKDIR /srv
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/srv/hf_cache \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
+    TRANSFORMERS_CACHE=/srv/hf_cache \
+    TORCH_HOME=/srv/hf_cache
+    
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \

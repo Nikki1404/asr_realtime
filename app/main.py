@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import time
-from collections import deque
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
@@ -11,30 +10,37 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from app.config import load_config
 from app.metrics import (
     ACTIVE_STREAMS, PARTIALS_TOTAL, FINALS_TOTAL, UTTERANCES_TOTAL,
-    TTFT_WALL, TTF_WALL, QUEUE_WAIT, INFER_SEC, AUDIO_SEC, RTF,
-    BACKLOG_MS
+    TTFT_WALL, TTF_WALL, QUEUE_WAIT, PREPROC_SEC, INFER_SEC, FLUSH_SEC,
+    AUDIO_SEC, RTF, BACKLOG_MS,
 )
 from app.gpu_monitor import start_gpu_monitor
 from app.vad import AdaptiveEnergyVAD
-from app.nemo_asr import NemoASR
+from app.endpointing import Endpointing
+from app.nemotron_streaming import NemotronStreamingASR
 
 cfg = load_config()
-logging.basicConfig(level=getattr(logging, cfg.log_level))
+logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO))
 log = logging.getLogger("asr_server")
 
 app = FastAPI()
 
-asr: NemoASR | None = None
+engine: NemotronStreamingASR | None = None
 gpu_sem: asyncio.Semaphore | None = None
 
 
 @app.on_event("startup")
 async def startup():
-    global asr, gpu_sem
-    asr = NemoASR(cfg.model_name, cfg.device, cfg.sample_rate)
-    asr.load()
-    gpu_sem = asyncio.Semaphore(cfg.max_concurrent_inferences)
+    global engine, gpu_sem
+    engine = NemotronStreamingASR(
+        model_name=cfg.model_name,
+        device=cfg.device,
+        sample_rate=cfg.sample_rate,
+        context_right=cfg.context_right,
+    )
+    load_sec = engine.load()
+    gpu_sem = asyncio.Semaphore(int(cfg.max_concurrent_inferences))
     start_gpu_monitor(cfg.enable_gpu_metrics, cfg.gpu_index)
+    log.info(f"Loaded model={cfg.model_name} in {load_sec:.2f}s on {cfg.device}")
 
 
 @app.get("/health")
@@ -49,18 +55,7 @@ async def metrics():
 
 @app.websocket("/ws/asr")
 async def ws_asr(ws: WebSocket):
-    """
-    Protocol:
-      - client sends first TEXT: {"mode":"mic"}
-      - then binary frames: PCM16, 16kHz, mono
-      - server emits:
-          {"type":"partial","text": "<committed + current>"}   while speaking
-          {"type":"final","text":"<segment>","segment_index":N, ...} on silence
-          {"type":"final_all","text":"<full transcript>"} on stream end
-      - client ends by sending b""
-    """
-    global asr, gpu_sem
-    assert asr is not None and gpu_sem is not None
+    assert engine is not None and gpu_sem is not None
 
     await ws.accept()
     ACTIVE_STREAMS.inc()
@@ -68,147 +63,82 @@ async def ws_asr(ws: WebSocket):
     client = f"{ws.client.host}:{ws.client.port}"
     log.info(f"WS connect {client}")
 
-    # handshake
-    try:
-        first = await ws.receive()
-        if not first.get("text"):
-            raise ValueError("No handshake")
-        mode = json.loads(first["text"]).get("mode", "mic")
-    except Exception:
-        mode = "mic"
+    session = engine.new_session(max_buffer_ms=cfg.max_buffer_ms)
+    vad = AdaptiveEnergyVAD(cfg.sample_rate, cfg.vad_frame_ms, cfg.vad_start_margin, cfg.vad_min_noise_rms, cfg.pre_speech_ms)
+    ep = Endpointing(cfg.end_silence_ms, cfg.min_utt_ms, cfg.max_utt_ms)
 
-    if mode != "mic":
-        await ws.send_text(json.dumps({"type": "error", "message": "Send handshake: {'mode':'mic'}"}))
-        await ws.close()
-        ACTIVE_STREAMS.dec()
-        return
-
-    vad = AdaptiveEnergyVAD(
-        sample_rate=cfg.sample_rate,
-        frame_ms=cfg.vad_frame_ms,
-        start_margin=cfg.vad_start_margin,
-        min_noise_rms=cfg.vad_min_noise_rms,
-        pre_speech_ms=cfg.pre_speech_ms,
-    )
-
-    frame_bytes = vad.frame_bytes
+    frame_bytes = int(cfg.sample_rate * (cfg.vad_frame_ms / 1000.0) * 2)
     raw_buf = bytearray()
 
-    # utterance tracking
     utt_started = False
-    utt_pcm = bytearray()
-    utt_ms = 0
-    silence_ms = 0
-
-    t_utt_start = None
+    utt_audio_ms = 0
+    t_utt_start = 0.0
     t_first_partial = None
-    last_partial_emit = 0.0
 
-    # Partial sliding window
-    win_frames = max(1, int(cfg.partial_window_ms / cfg.vad_frame_ms))
-    partial_ring = deque(maxlen=win_frames)
+    async def send_partial(text: str):
+        PARTIALS_TOTAL.inc()
+        await ws.send_text(json.dumps({"type": "partial", "text": text}))
 
-    # Transcript commit
-    full_committed = ""
-    segment_index = 0
+    async def finalize(reason: str):
+        nonlocal utt_started, utt_audio_ms, t_utt_start, t_first_partial
 
-    async def infer_pcm16(pcm16: bytes):
+        if not utt_started:
+            return
+
+        # GPU semaphore lock (concurrency)
         q0 = time.perf_counter()
         await gpu_sem.acquire()
         qwait = time.perf_counter() - q0
         if qwait > 0:
             QUEUE_WAIT.observe(qwait)
+
         try:
-            t0 = time.perf_counter()
-            audio = asr.pcm16_to_float32(pcm16)
-            text = await asyncio.to_thread(asr.transcribe_float32, audio)
-            dt = time.perf_counter() - t0
-            INFER_SEC.observe(dt)
-            return (text or "").strip(), dt
+            final_text = session.finalize(pad_ms=cfg.finalize_pad_ms)
         finally:
             gpu_sem.release()
 
-    def compose_partial(current: str) -> str:
-        cur = (current or "").strip()
-        if not cur:
-            return full_committed.strip()
-        if not full_committed.strip():
-            return cur
-        return f"{full_committed.strip()} {cur}"
+        # Emit even if empty? (usually keep it gated)
+        if final_text.strip():
+            UTTERANCES_TOTAL.inc()
+            FINALS_TOTAL.inc()
 
-    async def emit_partial_if_due():
-        nonlocal t_first_partial, last_partial_emit
-        now = time.time()
-        if (now - last_partial_emit) * 1000 < cfg.partial_every_ms:
-            return
-        if not utt_started:
-            return
-        if utt_ms < 300:
-            return
+            ttf = time.time() - t_utt_start
+            TTF_WALL.observe(ttf)
 
-        window_pcm = b"".join(partial_ring)
-        if len(window_pcm) < frame_bytes * 5:
-            return
+            audio_sec = max(0.001, utt_audio_ms / 1000.0)
+            AUDIO_SEC.observe(audio_sec)
 
-        text, _dt = await infer_pcm16(window_pcm)
-        if text:
-            if t_first_partial is None and t_utt_start is not None:
-                t_first_partial = time.time()
-                TTFT_WALL.observe(t_first_partial - t_utt_start)
+            # "compute" = preproc + infer + flush
+            compute = session.utt_preproc + session.utt_infer + session.utt_flush
+            rtf = compute / audio_sec
+            RTF.observe(rtf)
 
-            PARTIALS_TOTAL.inc()
-            await ws.send_text(json.dumps({
-                "type": "partial",
-                "text": compose_partial(text)
-            }))
+            PREPROC_SEC.observe(session.utt_preproc)
+            INFER_SEC.observe(session.utt_infer)
+            FLUSH_SEC.observe(session.utt_flush)
 
-        last_partial_emit = now
+            payload = {
+                "type": "final",
+                "text": final_text.strip(),
+                "reason": reason,
+                "ttft_ms": int(1000 * (t_first_partial - t_utt_start)) if t_first_partial else None,
+                "ttf_ms": int(1000 * ttf),
+                "audio_ms": utt_audio_ms,
+                "rtf": rtf,
+                "chunks": session.chunks,
+                "model_preproc_ms": int(1000 * session.utt_preproc),
+                "model_infer_ms": int(1000 * session.utt_infer),
+                "model_flush_ms": int(1000 * session.utt_flush),
+                "backlog_ms_end": session.backlog_ms(),
+            }
+            await ws.send_text(json.dumps(payload))
 
-    async def finalize_segment(reason: str):
-        nonlocal full_committed, segment_index, utt_started, utt_pcm, utt_ms, silence_ms, t_utt_start, t_first_partial
-
-        # small pad helps not cut last phoneme
-        if cfg.post_speech_pad_ms > 0:
-            pad_bytes = int(cfg.sample_rate * (cfg.post_speech_pad_ms / 1000.0) * 2)
-            utt_pcm.extend(b"\x00" * pad_bytes)
-            utt_ms += cfg.post_speech_pad_ms
-
-        t0 = time.time()
-        text, infer_dt = await infer_pcm16(bytes(utt_pcm))
-        ttf = time.time() - (t_utt_start or t0)
-
-        FINALS_TOTAL.inc()
-        UTTERANCES_TOTAL.inc()
-        TTF_WALL.observe(ttf)
-
-        audio_sec = utt_ms / 1000.0
-        AUDIO_SEC.observe(audio_sec)
-        if audio_sec > 0:
-            RTF.observe(infer_dt / audio_sec)
-
-        if text:
-            full_committed = (full_committed + " " + text).strip()
-
-        payload = {
-            "type": "final",
-            "text": text,
-            "segment_index": segment_index,
-            "reason": reason,
-            "audio_ms": utt_ms,
-            "ttft_wall_ms": int(1000 * ((t_first_partial - t_utt_start) if (t_first_partial and t_utt_start) else 0)) if t_first_partial else None,
-            "ttf_wall_ms": int(1000 * ttf),
-        }
-        await ws.send_text(json.dumps(payload))
-        segment_index += 1
-
-        # reset for next utterance
+        # reset utterance tracking
         utt_started = False
-        utt_pcm = bytearray()
-        partial_ring.clear()
-        utt_ms = 0
-        silence_ms = 0
-        t_utt_start = None
+        utt_audio_ms = 0
+        t_utt_start = 0.0
         t_first_partial = None
+        ep.reset()
         vad.reset()
         BACKLOG_MS.set(0)
 
@@ -220,17 +150,23 @@ async def ws_asr(ws: WebSocket):
 
             data = msg.get("bytes")
             if data is None:
+                # optional control message
+                txt = msg.get("text")
+                if txt:
+                    try:
+                        obj = json.loads(txt)
+                        if obj.get("type") == "end":
+                            await finalize("client_end")
+                    except Exception:
+                        pass
                 continue
 
-            # end stream
+            # client EOS
             if data == b"":
-                if utt_started and utt_ms >= cfg.min_utt_ms:
-                    await finalize_segment("eos")
-                await ws.send_text(json.dumps({"type": "final_all", "text": full_committed.strip()}))
+                await finalize("eos")
                 break
 
             raw_buf.extend(data)
-            BACKLOG_MS.set(max(0.0, (len(raw_buf) / (cfg.sample_rate * 2)) * 1000.0))
 
             while len(raw_buf) >= frame_bytes:
                 frame = bytes(raw_buf[:frame_bytes])
@@ -238,39 +174,48 @@ async def ws_asr(ws: WebSocket):
 
                 is_speech, pre_roll = vad.push_frame(frame)
 
-                if (not utt_started) and pre_roll:
+                if (not utt_started) and pre_roll is not None:
                     utt_started = True
-                    utt_pcm = bytearray()
-                    partial_ring.clear()
-
-                    utt_pcm.extend(pre_roll)
-                    partial_ring.append(pre_roll)
-
-                    utt_ms = int(1000 * (len(pre_roll) / 2) / cfg.sample_rate)
-                    silence_ms = 0
+                    utt_audio_ms = 0
                     t_utt_start = time.time()
                     t_first_partial = None
-                    last_partial_emit = 0.0
+                    ep.reset()
+                    session.reset_stream_state()
+
+                    # feed pre-roll + count
+                    session.accept_pcm16(pre_roll)
+                    utt_audio_ms += int(1000 * (len(pre_roll) / 2) / cfg.sample_rate)
 
                 if utt_started:
-                    utt_pcm.extend(frame)
-                    partial_ring.append(frame)
-                    utt_ms += cfg.vad_frame_ms
+                    session.accept_pcm16(frame)
+                    utt_audio_ms += cfg.vad_frame_ms
+                    BACKLOG_MS.set(session.backlog_ms())
 
-                    if is_speech:
-                        silence_ms = 0
-                    else:
-                        silence_ms += cfg.vad_frame_ms
+                    # streaming step loop (might emit multiple partial updates)
+                    while True:
+                        q0 = time.perf_counter()
+                        await gpu_sem.acquire()
+                        qwait = time.perf_counter() - q0
+                        if qwait > 0:
+                            QUEUE_WAIT.observe(qwait)
 
-                    await emit_partial_if_due()
+                        try:
+                            text = session.step_if_ready()
+                        finally:
+                            gpu_sem.release()
 
-                    # endpoint
-                    if silence_ms >= cfg.end_silence_ms and utt_ms >= cfg.min_utt_ms:
-                        await finalize_segment("silence_endpoint")
+                        if text is None:
+                            break
 
-                    # hard cap
-                    if utt_ms >= cfg.max_utt_ms:
-                        await finalize_segment("max_utt")
+                        if t_first_partial is None:
+                            t_first_partial = time.time()
+                            TTFT_WALL.observe(t_first_partial - t_utt_start)
+
+                        await send_partial(text)
+
+                    # endpointing on silence/pause
+                    if ep.update(is_speech, cfg.vad_frame_ms, utt_audio_ms):
+                        await finalize("pause")
 
     finally:
         ACTIVE_STREAMS.dec()
