@@ -1,0 +1,9 @@
+numpy<2.0
+fastapi
+uvicorn[standard]
+websockets
+prometheus-client
+pynvml
+soundfile
+resampy
+huggingface_hub
