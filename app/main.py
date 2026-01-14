@@ -61,34 +61,101 @@ async def ws_asr(ws: WebSocket):
     t_first_partial = None
     silence_ms = 0
 
-    # 🔴 FIX: server-side framing (20 ms)
-    frame_bytes = int(cfg.sample_rate * (cfg.vad_frame_ms / 1000) * 2)
+    # server-side framing to 20ms
+    frame_bytes = int(cfg.sample_rate * (cfg.vad_frame_ms / 1000.0) * 2)
     pcm_buffer = bytearray()
+
+    def reset_utt_state():
+        nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
+        vad.reset()
+        utt_started = False
+        utt_audio_ms = 0
+        t_start = None
+        t_first_partial = None
+        silence_ms = 0
+
+    async def finalize_and_emit(reason: str):
+        """
+        ✅ IMPORTANT FIX:
+        session.finalize() resets stats inside finalize(),
+        so we snapshot stats BEFORE calling finalize().
+        """
+        nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
+
+        if not utt_started:
+            return
+
+        # snapshot metrics BEFORE finalize() resets them
+        snap_chunks = int(getattr(session, "chunks", 0))
+        snap_preproc = float(getattr(session, "utt_preproc", 0.0))
+        snap_infer = float(getattr(session, "utt_infer", 0.0))
+
+        # measure flush wall time here (since utt_flush gets reset too)
+        flush_t0 = time.perf_counter()
+        final = session.finalize(cfg.finalize_pad_ms).strip()
+        flush_wall = time.perf_counter() - flush_t0
+
+        UTTERANCES_TOTAL.inc()
+        FINALS_TOTAL.inc()
+
+        # wall timings
+        now = time.time()
+        ttf_sec = (now - t_start) if t_start else 0.0
+        TTF_WALL.observe(ttf_sec)
+
+        if t_first_partial and t_start:
+            TTFT_WALL.observe(t_first_partial - t_start)
+
+        audio_sec = utt_audio_ms / 1000.0
+        AUDIO_SEC.observe(audio_sec)
+
+        # record histograms using snapshot values
+        PREPROC_SEC.observe(snap_preproc)
+        INFER_SEC.observe(snap_infer)
+        FLUSH_SEC.observe(flush_wall)
+
+        rtf = None
+        if audio_sec > 0:
+            rtf = snap_infer / audio_sec
+            RTF.observe(rtf)
+
+        payload = {
+            "type": "final",
+            "text": final,
+            "reason": reason,
+            "audio_ms": utt_audio_ms,
+            "ttft_ms": int((t_first_partial - t_start) * 1000) if (t_first_partial and t_start) else None,
+            "ttf_ms": int(ttf_sec * 1000),
+            "rtf": rtf,
+            "chunks": snap_chunks,
+            "preproc_ms": int(snap_preproc * 1000),
+            "infer_ms": int(snap_infer * 1000),
+            "flush_ms": int(flush_wall * 1000),
+        }
+
+        await ws.send_text(json.dumps(payload))
+
+        # reset for next utterance
+        reset_utt_state()
 
     try:
         while True:
             msg = await ws.receive()
+
             if msg["type"] == "websocket.disconnect":
+                # if client drops, flush what we have
+                await finalize_and_emit("disconnect")
                 break
 
             pcm = msg.get("bytes")
 
             # EOS from client
             if pcm == b"":
-                if utt_started:
-                    final = session.finalize(cfg.finalize_pad_ms).strip()
-                    UTTERANCES_TOTAL.inc()
-                    FINALS_TOTAL.inc()
-                    await ws.send_text(json.dumps({
-                        "type": "final",
-                        "text": final,
-                        "reason": "eos",
-                    }))
+                await finalize_and_emit("eos")
                 break
 
             pcm_buffer.extend(pcm)
 
-            # 🔴 FIX: always process exact VAD frames
             while len(pcm_buffer) >= frame_bytes:
                 frame = bytes(pcm_buffer[:frame_bytes])
                 del pcm_buffer[:frame_bytes]
@@ -111,21 +178,18 @@ async def ws_asr(ws: WebSocket):
                 if not utt_started:
                     continue
 
+                # accept audio
                 session.accept_pcm16(frame)
                 utt_audio_ms += cfg.vad_frame_ms
 
-                # streaming partials
+                # streaming partial
                 text = session.step_if_ready()
                 if text:
                     if t_first_partial is None:
                         t_first_partial = time.time()
-                        TTFT_WALL.observe(t_first_partial - t_start)
 
                     PARTIALS_TOTAL.inc()
-                    await ws.send_text(json.dumps({
-                        "type": "partial",
-                        "text": text
-                    }))
+                    await ws.send_text(json.dumps({"type": "partial", "text": text}))
 
                 # pause endpoint
                 should_finalize = (
@@ -138,48 +202,8 @@ async def ws_asr(ws: WebSocket):
                     should_finalize = True
 
                 if should_finalize:
-                    final = session.finalize(cfg.finalize_pad_ms).strip()
-
-                    UTTERANCES_TOTAL.inc()
-                    FINALS_TOTAL.inc()
-
-                    ttf = time.time() - t_start
-                    TTF_WALL.observe(ttf)
-
-                    AUDIO_SEC.observe(utt_audio_ms / 1000.0)
-                    PREPROC_SEC.observe(session.utt_preproc)
-                    INFER_SEC.observe(session.utt_infer)
-                    FLUSH_SEC.observe(session.utt_flush)
-
-                    rtf = None
-                    if utt_audio_ms > 0:
-                        rtf = session.utt_infer / (utt_audio_ms / 1000.0)
-                        RTF.observe(rtf)
-
-                    payload = {
-                        "type": "final",
-                        "text": final,
-                        "reason": "pause" if silence_ms >= cfg.end_silence_ms else "max_utt",
-                        "audio_ms": utt_audio_ms,
-                        "ttft_ms": int((t_first_partial - t_start) * 1000) if t_first_partial else None,
-                        "ttf_ms": int(ttf * 1000),
-                        "rtf": rtf,
-                        "chunks": session.chunks,
-                        "preproc_ms": int(session.utt_preproc * 1000),
-                        "infer_ms": int(session.utt_infer * 1000),
-                        "flush_ms": int(session.utt_flush * 1000),
-                    }
-
-                    await ws.send_text(json.dumps(payload))
-
-                    # reset
-                    session.reset_stream_state()
-                    vad.reset()
-                    utt_started = False
-                    utt_audio_ms = 0
-                    silence_ms = 0
-                    t_start = None
-                    t_first_partial = None
+                    reason = "pause" if silence_ms >= cfg.end_silence_ms else "max_utt"
+                    await finalize_and_emit(reason)
 
     finally:
         ACTIVE_STREAMS.dec()
