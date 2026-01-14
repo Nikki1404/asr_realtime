@@ -23,12 +23,10 @@ engine: NemotronStreamingASR | None = None
 async def startup():
     global engine
     engine = NemotronStreamingASR(
-        cfg.model_name,
-        cfg.device,
-        cfg.sample_rate,
-        cfg.context_right,
+        cfg.model_name, cfg.device, cfg.sample_rate, cfg.context_right
     )
-    engine.load()
+    load_sec = engine.load()
+    log.info(f"Loaded {cfg.model_name} in {load_sec:.2f}s")
 
 
 @app.get("/metrics")
@@ -54,18 +52,16 @@ async def ws_asr(ws: WebSocket):
 
     utt_started = False
     utt_audio_ms = 0
-    silence_ms = 0
     t_start = None
     t_first_partial = None
+    silence_ms = 0
 
     try:
         while True:
             msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-
             pcm = msg.get("bytes")
-            if pcm == b"":
+
+            if msg["type"] == "websocket.disconnect" or pcm == b"":
                 break
 
             is_speech, pre = vad.push_frame(pcm)
@@ -98,16 +94,23 @@ async def ws_asr(ws: WebSocket):
                 UTTERANCES_TOTAL.inc()
                 FINALS_TOTAL.inc()
 
-                audio_sec = utt_audio_ms / 1000.0
-                rtf = session.utt_infer / audio_sec if audio_sec > 0 else None
+                ttf = time.time() - t_start
+                TTF_WALL.observe(ttf)
+
+                audio_sec = utt_audio_ms / 1000
+                rtf = session.compute_sec_total / audio_sec if audio_sec > 0 else None
+                if rtf:
+                    RTF.observe(rtf)
 
                 payload = {
                     "type": "final",
                     "text": final,
                     "reason": "pause",
                     "audio_ms": utt_audio_ms,
-                    "chunks": session.chunks,
+                    "ttft_ms": int((t_first_partial - t_start) * 1000) if t_first_partial else None,
+                    "ttf_ms": int(ttf * 1000),
                     "rtf": rtf,
+                    "chunks": session.chunks,
                     "preproc_ms": int(session.utt_preproc * 1000),
                     "infer_ms": int(session.utt_infer * 1000),
                     "flush_ms": int(session.utt_flush * 1000),
