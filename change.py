@@ -1,88 +1,42 @@
-(venv) PS C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts> python .\ws_client.py --url ws://127.0.0.1:8002/ws/asr
+INFO:asr_server:WS connected: Address(host='172.17.0.1', port=54814)
+INFO:     connection open
+INFO:asr_server:WS disconnected
+ERROR:    Exception in ASGI application
 Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 201, in <module>
-    asyncio.run(main())
-    ~~~~~~~~~~~^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 165, in main
-    async with websockets.connect(args.url, max_size=None) as ws:
-               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 587, in __aenter__
-    return await self
-           ^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 541, in __await_impl__
-    self.connection = await self.create_connection()
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 467, in create_connection
-    _, connection = await loop.create_connection(factory, **kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1166, in create_connection
-    raise exceptions[0]
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1141, in create_connection
-    sock = await self._connect_sock(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-        exceptions, addrinfo, laddr_infos)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1044, in _connect_sock
-    await self.sock_connect(sock, address)
-  File "C:\Program Files\Python313\Lib\asyncio\proactor_events.py", line 726, in sock_connect
-    return await self._proactor.connect(sock, address)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 804, in _poll
-    value = callback(transferred, key, ov)
-  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 600, in finish_connect
-    ov.getresult()
-    ~~~~~~~~~~~~^^
-ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
-(venv) PS C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts> python .\ws_client.py --url ws://127.0.0.1:8002/ws/asr
-Traceback (most recent call last):
-  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 201, in <module>
-    asyncio.run(main())
-    ~~~~~~~~~~~^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 165, in main
-    async with websockets.connect(args.url, max_size=None) as ws:
-               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 587, in __aenter__
-    return await self
-           ^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 541, in __await_impl__
-    self.connection = await self.create_connection()
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\re_nikitav\AppData\Roaming\Python\Python313\site-packages\websockets\asyncio\client.py", line 467, in create_connection
-    _, connection = await loop.create_connection(factory, **kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1166, in create_connection
-    raise exceptions[0]
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1141, in create_connection
-    sock = await self._connect_sock(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-        exceptions, addrinfo, laddr_infos)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1044, in _connect_sock
-    await self.sock_connect(sock, address)
-  File "C:\Program Files\Python313\Lib\asyncio\proactor_events.py", line 726, in sock_connect
-    return await self._proactor.connect(sock, address)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 804, in _poll
-    value = callback(transferred, key, ov)
-  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 600, in finish_connect
-    ov.getresult()
-    ~~~~~~~~~~~~^^
-ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/protocols/websockets/websockets_impl.py", line 244, in run_asgi
+    result = await self.app(self.scope, self.asgi_receive, self.asgi_send)  # type: ignore[func-returns-value]
+  File "/usr/local/lib/python3.10/dist-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/applications.py", line 1135, in __call__
+    await super().__call__(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/applications.py", line 107, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/errors.py", line 151, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/routing.py", line 364, in handle
+    await self.app(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 141, in app
+    await wrap_app_handling_exceptions(app, session)(scope, receive, send)
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/usr/local/lib/python3.10/dist-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 138, in app
+    await func(session)
+  File "/usr/local/lib/python3.10/dist-packages/fastapi/routing.py", line 438, in app
+    await dependant.call(**solved_result.values)
+  File "/srv/app/main.py", line 129, in ws_asr
+    final = session.finalize(cfg.post_speech_pad_ms)
+AttributeError: 'Config' object has no attribute 'post_speech_pad_ms'
