@@ -108,6 +108,7 @@ Quick update on the Nemotron real-time ASR work:
 - Real-time transcription is now working smoothly with live partials + accurate final transcripts.
 - Latency metrics are now correctly emitted per utterance (no need to scrape /metrics).
 - Latest benchmark from mic input:
+  
       - TTFT (first partial): ~517 ms
       - Final transcript delay after pause: ~35 ms
       - RTF: ~0.25 (≈ 4× faster than real-time)
