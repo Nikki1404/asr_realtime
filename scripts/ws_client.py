@@ -19,12 +19,8 @@ except Exception:
     HAS_MIC = False
 
 TARGET_SR = 16000
-
-# For Nemotron RNNT stability: 80–120ms chunks work well
-CHUNK_MS = 80
-CHUNK_FRAMES = int(TARGET_SR * CHUNK_MS / 1000)
-SLEEP_SEC = CHUNK_MS / 1000.0
-
+FRAME_MS = 20
+FRAME_SAMPLES = int(TARGET_SR * FRAME_MS / 1000)
 
 def resample_to_16k(wav_path: str) -> str:
     audio, sr = sf.read(wav_path, dtype="float32")
@@ -40,11 +36,7 @@ def resample_to_16k(wav_path: str) -> str:
     sf.write(tmp.name, audio, TARGET_SR, subtype="PCM_16")
     return tmp.name
 
-
 async def receiver(ws):
-    """
-    Prints partials live. Prints finals + server metrics after pause.
-    """
     finals = []
     while True:
         try:
@@ -65,7 +57,6 @@ async def receiver(ws):
             print("\n[FINAL]", txt)
             finals.append(txt)
 
-            # Print per-utterance metrics
             print("[SERVER_METRICS]",
                   f"reason={obj.get('reason')}",
                   f"ttft_ms={obj.get('ttft_ms')}",
@@ -73,33 +64,29 @@ async def receiver(ws):
                   f"audio_ms={obj.get('audio_ms')}",
                   f"rtf={obj.get('rtf')}",
                   f"chunks={obj.get('chunks')}",
-                  f"preproc_ms={obj.get('model_preproc_ms')}",
-                  f"infer_ms={obj.get('model_infer_ms')}",
-                  f"flush_ms={obj.get('model_flush_ms')}",
+                  f"preproc_ms={obj.get('preproc_ms')}",
+                  f"infer_ms={obj.get('infer_ms')}",
+                  f"flush_ms={obj.get('flush_ms')}",
                   )
-    # unreachable
-
 
 async def run_wav(ws, wav_path: str, realtime: bool):
     with wave.open(wav_path, "rb") as wf:
         while True:
-            data = wf.readframes(CHUNK_FRAMES)
+            data = wf.readframes(FRAME_SAMPLES)
             if not data:
                 break
             await ws.send(data)
             if realtime:
-                await asyncio.sleep(SLEEP_SEC)
+                await asyncio.sleep(FRAME_MS / 1000.0)
 
-    # Let server endpoint by sending a bit of silence, then EOS
-    silence_frames = int(TARGET_SR * 0.8)
-    await ws.send(b"\x00\x00" * silence_frames)
-    await asyncio.sleep(0.8)
+    # send a bit of silence to ensure endpointing, then EOS
+    await ws.send(b"\x00\x00" * int(TARGET_SR * 1.0))
+    await asyncio.sleep(1.0)
     await ws.send(b"")
-
 
 async def run_mic(ws):
     if not HAS_MIC:
-        raise RuntimeError("sounddevice not installed. Install: pip install sounddevice")
+        raise RuntimeError("sounddevice not installed. pip install sounddevice")
 
     loop = asyncio.get_running_loop()
     q: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
@@ -111,11 +98,10 @@ async def run_mic(ws):
         samplerate=TARGET_SR,
         channels=1,
         dtype="int16",
-        blocksize=CHUNK_FRAMES,
+        blocksize=FRAME_SAMPLES,   # ✅ 20ms blocks (server expects this)
         callback=cb,
     )
     stream.start()
-
     print("🎤 Speak freely. Pause to end sentences. Ctrl+C to exit.")
 
     async def sender():
@@ -139,17 +125,16 @@ async def run_mic(ws):
         stream.stop()
         stream.close()
 
-        # Send EOS so server can finalize if something is pending
+        # Send EOS so server finalizes any pending utterance
         try:
-            await ws.send(b"\x00\x00" * int(TARGET_SR * 0.8))
-            await asyncio.sleep(0.8)
+            await ws.send(b"\x00\x00" * int(TARGET_SR * 1.0))
+            await asyncio.sleep(1.0)
             await ws.send(b"")
         except Exception:
             pass
 
         await q.put(None)
         await send_task
-
 
 async def main():
     p = argparse.ArgumentParser()
@@ -160,7 +145,6 @@ async def main():
     args = p.parse_args()
 
     start = time.time()
-    t_first_final = None
 
     async with websockets.connect(args.url, max_size=None) as ws:
         print(f"[INFO] Connected to {args.url}")
@@ -177,6 +161,7 @@ async def main():
             cleanup = None
             with wave.open(wav, "rb") as wf:
                 sr, ch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+
             if sr != TARGET_SR or ch != 1 or sw != 2:
                 print(f"[INFO] Resampling WAV → 16kHz mono PCM16 (src={sr}Hz ch={ch} sw={sw})")
                 wav = resample_to_16k(wav)
@@ -195,7 +180,6 @@ async def main():
 
     print("\nCLIENT METRICS:")
     print(f"Total wall time: {total:.2f}s")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
