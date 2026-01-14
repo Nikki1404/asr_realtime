@@ -2,6 +2,11 @@ from collections import deque
 import numpy as np
 
 class AdaptiveEnergyVAD:
+    """
+    Adaptive noise-floor VAD.
+    Speech if RMS > noise_rms * start_margin.
+    Keeps a pre-speech ring buffer so we don't cut initial phonemes.
+    """
     def __init__(self, sample_rate: int, frame_ms: int, start_margin: float, min_noise_rms: float, pre_speech_ms: int):
         self.sr = sample_rate
         self.frame_ms = frame_ms
@@ -20,6 +25,7 @@ class AdaptiveEnergyVAD:
     def reset(self):
         self.ring.clear()
         self.in_speech = False
+        self.noise_rms = self.min_noise_rms
 
     def _rms(self, pcm16: bytes) -> float:
         x = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
@@ -28,6 +34,7 @@ class AdaptiveEnergyVAD:
     def push_frame(self, frame_pcm16: bytes):
         e = self._rms(frame_pcm16)
 
+        # Update noise floor when not in speech (EMA)
         if not self.in_speech:
             alpha = 0.95
             self.noise_rms = max(self.min_noise_rms, alpha * self.noise_rms + (1 - alpha) * e)
@@ -43,7 +50,7 @@ class AdaptiveEnergyVAD:
             pre_roll = b"".join(self.ring)
 
         if self.in_speech and (not is_speech):
-            # we do not flip off here; endpointing decides finalization
+            # we don't immediately flip off; endpointing will handle finalization
             pass
 
         return is_speech, pre_roll
