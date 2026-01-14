@@ -1,6 +1,6 @@
-[PARTIAL] Hi, this is Mike Testing for ASR Realitine Nemotron. I want to check the matrix if I am getting the live                   [PARTIAL] Hi, this is Mike Testing for ASR Realitine Nemotron. I want to check the matrix if I am getting the live mat               [PARTIAL] Hi, this is Mike Testing for ASR Realitine Nemotron. I want to check the matrix if I am getting the live matrix            [PARTIAL] Hi, this is Mike Testing for ASR Realitine Nemotron. I want to check the matrix if I am getting the live matrix or not     
-[FINAL] Hi, this is Mike Testing for ASR Realitine Nemotron. I want to check the matrix if I am getting the live matrix or not
-[SERVER_METRICS] reason=pause ttft_ms=846 ttf_ms=10521 audio_ms=10500 rtf=0.0 chunks=0 preproc_ms=0 infer_ms=0 flush_ms=0
-[PARTIAL] I want to get the real time metrics if I can get it would be really great please provide me the real time                  [PARTIAL] I want to get the real time metrics if I can get it would be really great please provide me the real time met              [PARTIAL] I want to get the real time metrics if I can get it would be really great please provide me the real time metrics          
-[FINAL] I want to get the real time metrics if I can get it would be really great please provide me the real time metrics
-[SERVER_METRICS] reason=pause ttft_ms=521 ttf_ms=7171 audio_ms=7160 rtf=0.0 chunks=0 preproc_ms=0 infer_ms=0 flush_ms=0
+(asr_env) PS C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts> python .\ws_client.py --mic --url ws://127.0.0.1:8003/ws/asr
+[INFO] Connected to ws://127.0.0.1:8003/ws/asr
+🎤 Speak freely. Pause to end sentences. Ctrl+C to exit.
+[PARTIAL] Hello, this is Mike Testing, I'm testing ASR Nemoton real time if it is emitting the matrix or not
+[FINAL] Hello, this is Mike Testing, I'm testing ASR Nemoton real time if it is emitting the matrix or not
+[SERVER_METRICS] reason=pause ttft_ms=517 ttf_ms=7635 audio_ms=7600 rtf=0.252732925674584 chunks=26 preproc_ms=466 infer_ms=1920 flush_ms=40
