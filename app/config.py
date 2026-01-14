@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import os
 
-
 @dataclass
 class Config:
     # Model
@@ -33,13 +32,12 @@ class Config:
     # Concurrency
     max_concurrent_inferences: int = int(os.getenv("MAX_CONCURRENT_INFERENCES", "1"))
 
-    # GPU metrics
-    enable_gpu_metrics: bool = os.getenv("ENABLE_GPU_METRICS", "1") == "1"
+    # GPU metrics (optional)
+    enable_gpu_metrics: bool = os.getenv("ENABLE_GPU_METRICS", "0") == "1"
     gpu_index: int = int(os.getenv("GPU_INDEX", "0"))
 
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
-
 
 def load_config() -> Config:
     return Config()
