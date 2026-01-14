@@ -37,11 +37,10 @@ class NemotronStreamingASR:
         self.device = device
         self.sr = sample_rate
         self.context_right = context_right
-
         self.model = None
+
         self.shift_frames = 0
         self.pre_cache_frames = 0
-        self.hop_samples = 0
         self.drop_extra = 0
 
     def load(self) -> float:
@@ -81,9 +80,6 @@ class NemotronStreamingASR:
         self.pre_cache_frames = pre_cache[1] if isinstance(pre_cache, (list, tuple)) else pre_cache
         self.drop_extra = int(getattr(scfg, "drop_extra_pre_encoded", 0))
 
-        hop_sec = float(self.model.cfg.preprocessor.get("window_stride", 0.01))
-        self.hop_samples = int(hop_sec * self.sr)
-
         self._warmup()
         return time.time() - t0
 
@@ -91,17 +87,8 @@ class NemotronStreamingASR:
     def _warmup(self):
         warm = np.zeros(int(self.sr * 1.0), dtype=np.float32)
         cache = self.model.encoder.get_initial_cache_state(batch_size=1)
-        self.stream_transcribe(
-            audio_f32=warm,
-            cache=(cache[0], cache[1], cache[2]),
-            prev_hyp=None,
-            prev_pred_out=None,
-            emitted_frames=0,
-            force_flush=True,
-        )
-
-    def new_session(self, max_buffer_ms: int):
-        return StreamingSession(self, max_buffer_ms)
+        cache = (cache[0], cache[1], cache[2])
+        _ = self.stream_transcribe(warm, cache, None, None, 0, force_flush=True)
 
     @torch.inference_mode()
     def stream_transcribe(
@@ -110,7 +97,7 @@ class NemotronStreamingASR:
         cache,
         prev_hyp,
         prev_pred_out,
-        emitted_frames: int,
+        emitted_frames,
         force_flush: bool = False,
     ):
         timings = StreamTimings()
@@ -120,7 +107,7 @@ class NemotronStreamingASR:
         if self.device == "cuda":
             audio_tensor = audio_tensor.cuda()
         audio_len = torch.tensor([len(audio_f32)], device=audio_tensor.device)
-        mel, _ = self.model.preprocessor(input_signal=audio_tensor, length=audio_len)
+        mel, _ = self.model.preprocessor(audio_tensor, audio_len)
         timings.preproc_sec += time.perf_counter() - t0
 
         available = int(mel.shape[-1]) - 1
@@ -130,46 +117,42 @@ class NemotronStreamingASR:
         if (available - emitted_frames) < self.shift_frames and not force_flush:
             return None, cache, prev_hyp, prev_pred_out, emitted_frames, timings
 
-        if emitted_frames == 0:
-            chunk_start = 0
-            chunk_end = min(self.shift_frames, available)
-            drop_extra = 0
-        else:
-            chunk_start = max(0, emitted_frames - self.pre_cache_frames)
-            chunk_end = min(emitted_frames + self.shift_frames, available)
-            drop_extra = self.drop_extra
-
+        chunk_start = max(0, emitted_frames - self.pre_cache_frames)
+        chunk_end = min(emitted_frames + self.shift_frames, available)
         chunk = mel[:, :, chunk_start:chunk_end]
         chunk_len = torch.tensor([chunk.shape[-1]], device=chunk.device)
 
         t1 = time.perf_counter()
         prev_pred_out, texts, c0, c1, c2, prev_hyp = self.model.conformer_stream_step(
-            processed_signal=chunk,
-            processed_signal_length=chunk_len,
-            cache_last_channel=cache[0],
-            cache_last_time=cache[1],
-            cache_last_channel_len=cache[2],
+            chunk,
+            chunk_len,
+            cache[0],
+            cache[1],
+            cache[2],
+            keep_all_outputs=False,
             previous_hypotheses=prev_hyp,
             previous_pred_out=prev_pred_out,
-            drop_extra_pre_encoded=drop_extra,
+            drop_extra_pre_encoded=self.drop_extra,
             return_transcription=True,
         )
         timings.infer_sec += time.perf_counter() - t1
 
+        cache = (c0, c1, c2)
         emitted_frames = min(emitted_frames + self.shift_frames, available)
-        text = safe_text(texts[0]) if texts else ""
 
-        return text.strip(), (c0, c1, c2), prev_hyp, prev_pred_out, emitted_frames, timings
+        text = safe_text(texts[0]) if texts else ""
+        return text.strip(), cache, prev_hyp, prev_pred_out, emitted_frames, timings
 
 
 class StreamingSession:
     """
-    Per-connection streaming state + metrics.
+    Per-utterance streaming state.
+    METRICS FIXED HERE.
     """
 
     def __init__(self, engine: NemotronStreamingASR, max_buffer_ms: int):
         self.engine = engine
-        self.max_buffer_samples = int(engine.sr * (max_buffer_ms / 1000))
+        self.max_samples = int(engine.sr * max_buffer_ms / 1000)
         self.reset_stream_state()
 
     def reset_stream_state(self):
@@ -181,55 +164,60 @@ class StreamingSession:
         self.audio = np.array([], dtype=np.float32)
         self.current_text = ""
 
-        # ✅ metrics
+        # ✅ METRICS
         self.utt_preproc = 0.0
         self.utt_infer = 0.0
         self.utt_flush = 0.0
+        self.compute_sec_total = 0.0
         self.chunks = 0
 
     def accept_pcm16(self, pcm16: bytes):
         x = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
         self.audio = np.concatenate([self.audio, x])
-        if len(self.audio) > self.max_buffer_samples:
-            self.audio = self.audio[-self.max_buffer_samples:]
+        if len(self.audio) > self.max_samples:
+            self.audio = self.audio[-self.max_samples:]
 
     def step_if_ready(self) -> Optional[str]:
+        t0 = time.perf_counter()
         text, self.cache, self.prev_hyp, self.prev_pred, self.emitted_frames, t = \
             self.engine.stream_transcribe(
-                self.audio,
-                self.cache,
-                self.prev_hyp,
-                self.prev_pred,
-                self.emitted_frames,
-                False,
+                self.audio, self.cache, self.prev_hyp,
+                self.prev_pred, self.emitted_frames, False
             )
+        wall = time.perf_counter() - t0
 
         self.utt_preproc += t.preproc_sec
         self.utt_infer += t.infer_sec
+        self.compute_sec_total += wall
+        self.chunks += 1
 
-        if text and text != self.current_text:
-            self.current_text = text
-            self.chunks += 1
-            return text
-        return None
+        if not text or text == self.current_text:
+            return None
+
+        self.current_text = text
+        return text
 
     def finalize(self, pad_ms: int) -> str:
         pad = np.zeros(int(self.engine.sr * pad_ms / 1000), dtype=np.float32)
         self.audio = np.concatenate([self.audio, pad])
 
         t0 = time.perf_counter()
-        text, *_ , t = self.engine.stream_transcribe(
-            self.audio,
-            self.cache,
-            self.prev_hyp,
-            self.prev_pred,
-            self.emitted_frames,
-            True,
-        )
+        text, self.cache, self.prev_hyp, self.prev_pred, self.emitted_frames, t = \
+            self.engine.stream_transcribe(
+                self.audio, self.cache, self.prev_hyp,
+                self.prev_pred, self.emitted_frames, True
+            )
+        wall = time.perf_counter() - t0
+
         self.utt_preproc += t.preproc_sec
         self.utt_infer += t.infer_sec
-        self.utt_flush += time.perf_counter() - t0
+        self.utt_flush += wall
+        self.compute_sec_total += wall
+        self.chunks += 1
 
-        final = (text or self.current_text).strip()
+        if text:
+            self.current_text = text
+
+        final = self.current_text.strip()
         self.reset_stream_state()
         return final
