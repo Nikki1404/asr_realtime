@@ -1,199 +1,34 @@
-import json
-import time
-import logging
+        key_phrases_file: null
+        key_phrases_list: null
+        context_score: 1.0
+        depth_scaling: 2.0
+        unk_score: 0.0
+        final_eos_score: 1.0
+        score_per_phrase: 0.0
+        source_lang: en
+        use_triton: true
+        uniform_weights: false
+        use_bpe_dropout: false
+        num_of_transcriptions: 5
+        bpe_alpha: 0.3
+      boosting_tree_alpha: 0.0
+      hat_subtract_ilm: false
+      hat_ilm_weight: 0.0
+      max_symbols_per_step: 10
+      blank_lm_score_mode: LM_WEIGHTED_FULL
+      pruning_mode: LATE
+      allow_cuda_graphs: true
+    temperature: 1.0
+    durations: []
+    big_blank_durations: []
 
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import Response
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-
-from app.config import load_config
-from app.metrics import *
-from app.vad import AdaptiveEnergyVAD
-from app.nemotron_streaming import NemotronStreamingASR
-
-cfg = load_config()
-logging.basicConfig(level=cfg.log_level)
-log = logging.getLogger("asr_server")
-
-app = FastAPI()
-engine: NemotronStreamingASR | None = None
-
-
-@app.on_event("startup")
-async def startup():
-    global engine
-    engine = NemotronStreamingASR(
-        model_name=cfg.model_name,
-        device=cfg.device,
-        sample_rate=cfg.sample_rate,
-        context_right=getattr(cfg, "context_right", 64),
-    )
-    load_sec = engine.load()
-    log.info(f"Loaded {cfg.model_name} in {load_sec:.2f}s")
+INFO:asr_server:Loaded model=nvidia/nemotron-speech-streaming-en-0.6b in 27.16s on cuda
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8003 (Press CTRL+C to quit)
 
 
-@app.get("/metrics")
-async def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
-@app.websocket("/ws/asr")
-async def ws_asr(ws: WebSocket):
-    assert engine is not None
-
-    await ws.accept()
-    ACTIVE_STREAMS.inc()
-    log.info(f"WS connect {ws.client.host}:{ws.client.port}")
-
-    vad = AdaptiveEnergyVAD(
-        cfg.sample_rate,
-        cfg.vad_frame_ms,
-        cfg.vad_start_margin,
-        cfg.vad_min_noise_rms,
-        cfg.pre_speech_ms,
-    )
-
-    # IMPORTANT: set max buffer in session so preprocessing doesn't grow forever
-    session = engine.new_session(max_buffer_ms=cfg.max_utt_ms)
-
-    frame_bytes = int(cfg.sample_rate * cfg.vad_frame_ms / 1000.0) * 2
-    raw_buf = bytearray()
-
-    utt_started = False
-    utt_audio_ms = 0
-    t_start = None
-    t_first_partial = None
-    silence_ms = 0
-
-    async def emit_final(reason: str):
-        nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
-
-        if not utt_started:
-            return
-
-        final = session.finalize(cfg.post_speech_pad_ms)
-
-        # If you want metrics even for empty final, remove this guard
-        if final.strip() == "":
-            # reset state and return
-            vad.reset()
-            utt_started = False
-            utt_audio_ms = 0
-            t_start = None
-            t_first_partial = None
-            silence_ms = 0
-            return
-
-        UTTERANCES_TOTAL.inc()
-        FINALS_TOTAL.inc()
-
-        ttf = time.time() - (t_start or time.time())
-        TTF_WALL.observe(ttf)
-
-        audio_sec = utt_audio_ms / 1000.0
-        AUDIO_SEC.observe(audio_sec)
-
-        # Compute time from session (already tracked in your StreamingSession)
-        compute_sec = session.utt_preproc + session.utt_infer + session.utt_flush
-        rtf = (compute_sec / audio_sec) if audio_sec > 0 else None
-        if rtf is not None:
-            RTF.observe(rtf)
-
-        payload = {
-            "type": "final",
-            "text": final,
-            "reason": reason,
-            "audio_ms": utt_audio_ms,
-            "ttf_ms": int(ttf * 1000),
-            "ttft_ms": int((t_first_partial - t_start) * 1000) if (t_first_partial and t_start) else None,
-            "chunks": session.chunks,
-            "model_preproc_ms": int(session.utt_preproc * 1000),
-            "model_infer_ms": int(session.utt_infer * 1000),
-            "model_flush_ms": int(session.utt_flush * 1000),
-            "rtf": rtf,
-        }
-
-        await ws.send_text(json.dumps(payload))
-
-        # reset for next utterance
-        vad.reset()
-        utt_started = False
-        utt_audio_ms = 0
-        t_start = None
-        t_first_partial = None
-        silence_ms = 0
-
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-
-            pcm = msg.get("bytes")
-            if pcm is None:
-                continue
-
-            # EOS marker from client = end-of-utterance (DO NOT CLOSE SOCKET)
-            if pcm == b"":
-                await emit_final("client_eou")
-                continue
-
-            raw_buf.extend(pcm)
-
-            while len(raw_buf) >= frame_bytes:
-                frame = bytes(raw_buf[:frame_bytes])
-                del raw_buf[:frame_bytes]
-
-                is_speech, pre = vad.push_frame(frame)
-
-                if is_speech:
-                    silence_ms = 0
-                else:
-                    silence_ms += cfg.vad_frame_ms
-
-                if pre and not utt_started:
-                    utt_started = True
-                    utt_audio_ms = 0
-                    t_start = time.time()
-                    t_first_partial = None
-                    silence_ms = 0
-                    session.accept_pcm16(pre)
-
-                if not utt_started:
-                    continue
-
-                session.accept_pcm16(frame)
-                utt_audio_ms += cfg.vad_frame_ms
-
-                text = session.step_if_ready()
-                if text:
-                    PARTIALS_TOTAL.inc()
-                    if t_first_partial is None:
-                        t_first_partial = time.time()
-                        TTFT_WALL.observe(t_first_partial - t_start)
-                    await ws.send_text(json.dumps({"type": "partial", "text": text}))
-
-                # Finalize on pause
-                if (
-                    (not is_speech)
-                    and utt_audio_ms >= cfg.min_utt_ms
-                    and silence_ms >= cfg.end_silence_ms
-                ):
-                    await emit_final("server_pause")
-
-                # Hard cap
-                elif utt_audio_ms >= cfg.max_utt_ms:
-                    await emit_final("server_max_utt")
-
-    finally:
-        ACTIVE_STREAMS.dec()
-        try:
-            await ws.close()
-        except Exception:
-            pass
-        log.info("WS disconnect")
-
-
+and my ws_client.py is -
 import asyncio
 import argparse
 import json
@@ -215,16 +50,8 @@ except Exception:
     HAS_MIC = False
 
 TARGET_SR = 16000
-
-CHUNK_MS = 80
-CHUNK_FRAMES = int(TARGET_SR * CHUNK_MS / 1000)
-SLEEP_SEC = CHUNK_MS / 1000.0
-
-# Client-side pause detection (tune if needed)
-PAUSE_MS = 1400          # should match/beat server END_SILENCE_MS
-RMS_THRESHOLD = 0.008    # raise if fan noise triggers false speech
-TAIL_SIL_MS = 800        # silence to help model finalize
-
+FRAME_MS = 20
+FRAME_SAMPLES = int(TARGET_SR * FRAME_MS / 1000)
 
 def resample_to_16k(wav_path: str) -> str:
     audio, sr = sf.read(wav_path, dtype="float32")
@@ -239,7 +66,6 @@ def resample_to_16k(wav_path: str) -> str:
     tmp.close()
     sf.write(tmp.name, audio, TARGET_SR, subtype="PCM_16")
     return tmp.name
-
 
 async def receiver(ws):
     finals = []
@@ -269,32 +95,29 @@ async def receiver(ws):
                   f"audio_ms={obj.get('audio_ms')}",
                   f"rtf={obj.get('rtf')}",
                   f"chunks={obj.get('chunks')}",
-                  f"preproc_ms={obj.get('model_preproc_ms')}",
-                  f"infer_ms={obj.get('model_infer_ms')}",
-                  f"flush_ms={obj.get('model_flush_ms')}",
+                  f"preproc_ms={obj.get('preproc_ms')}",
+                  f"infer_ms={obj.get('infer_ms')}",
+                  f"flush_ms={obj.get('flush_ms')}",
                   )
-
 
 async def run_wav(ws, wav_path: str, realtime: bool):
     with wave.open(wav_path, "rb") as wf:
         while True:
-            data = wf.readframes(CHUNK_FRAMES)
+            data = wf.readframes(FRAME_SAMPLES)
             if not data:
                 break
             await ws.send(data)
             if realtime:
-                await asyncio.sleep(SLEEP_SEC)
+                await asyncio.sleep(FRAME_MS / 1000.0)
 
-    # finalize
-    silence_frames = int(TARGET_SR * (TAIL_SIL_MS / 1000))
-    await ws.send(b"\x00\x00" * silence_frames)
-    await asyncio.sleep(TAIL_SIL_MS / 1000)
-    await ws.send(b"")  # end-of-utterance marker (server will NOT close)
-
+    # send a bit of silence to ensure endpointing, then EOS
+    await ws.send(b"\x00\x00" * int(TARGET_SR * 1.0))
+    await asyncio.sleep(1.0)
+    await ws.send(b"")
 
 async def run_mic(ws):
     if not HAS_MIC:
-        raise RuntimeError("sounddevice not installed. Install: pip install sounddevice")
+        raise RuntimeError("sounddevice not installed. pip install sounddevice")
 
     loop = asyncio.get_running_loop()
     q: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
@@ -306,57 +129,47 @@ async def run_mic(ws):
         samplerate=TARGET_SR,
         channels=1,
         dtype="int16",
-        blocksize=CHUNK_FRAMES,
+        blocksize=FRAME_SAMPLES,   # ✅ 20ms blocks (server expects this)
         callback=cb,
     )
     stream.start()
-
     print("🎤 Speak freely. Pause to end sentences. Ctrl+C to exit.")
 
-    last_voice_ts = time.time()
-    in_utt = False
-
-    try:
+    async def sender():
         while True:
             blk = await q.get()
             if blk is None:
-                break
-
-            # RMS on int16 block
-            x = blk.astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(x * x) + 1e-12))
-
-            now = time.time()
-            is_voice = rms >= RMS_THRESHOLD
-
-            if is_voice:
-                last_voice_ts = now
-                in_utt = True
+                return
+            try:
                 await ws.send(blk.tobytes())
-            else:
-                # don't spam server with noise blocks
-                # but if we are in an utterance and paused long enough -> finalize
-                if in_utt and ((now - last_voice_ts) * 1000.0) >= PAUSE_MS:
-                    # tail silence + EOU marker
-                    silence_frames = int(TARGET_SR * (TAIL_SIL_MS / 1000))
-                    await ws.send(b"\x00\x00" * silence_frames)
-                    await asyncio.sleep(TAIL_SIL_MS / 1000)
-                    await ws.send(b"")  # end-of-utterance marker
-                    in_utt = False
+            except websockets.exceptions.ConnectionClosed:
+                return
 
-            await asyncio.sleep(0)  # yield
+    send_task = asyncio.create_task(sender())
 
+    try:
+        while True:
+            await asyncio.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
         stream.stop()
         stream.close()
-        await q.put(None)
 
+        # Send EOS so server finalizes any pending utterance
+        try:
+            await ws.send(b"\x00\x00" * int(TARGET_SR * 1.0))
+            await asyncio.sleep(1.0)
+            await ws.send(b"")
+        except Exception:
+            pass
+
+        await q.put(None)
+        await send_task
 
 async def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--url", default="ws://127.0.0.1:8002/ws/asr")
+    p.add_argument("--url", default="ws://127.0.0.1:8003/ws/asr")
     p.add_argument("--wav", help="Path to wav file")
     p.add_argument("--mic", action="store_true", help="Use live microphone")
     p.add_argument("--fast", action="store_true", help="Disable realtime pacing (wav only)")
@@ -379,20 +192,16 @@ async def main():
             cleanup = None
             with wave.open(wav, "rb") as wf:
                 sr, ch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+
             if sr != TARGET_SR or ch != 1 or sw != 2:
                 print(f"[INFO] Resampling WAV → 16kHz mono PCM16 (src={sr}Hz ch={ch} sw={sw})")
                 wav = resample_to_16k(wav)
                 cleanup = wav
 
             await run_wav(ws, wav, realtime=not args.fast)
+
             if cleanup:
                 os.unlink(cleanup)
-
-        # user ended mic with Ctrl+C -> close socket so receiver finishes
-        try:
-            await ws.close()
-        except Exception:
-            pass
 
         finals = await recv_task
 
@@ -403,54 +212,52 @@ async def main():
     print("\nCLIENT METRICS:")
     print(f"Total wall time: {total:.2f}s")
 
-
 if __name__ == "__main__":
     asyncio.run(main())
+then why getting this 
+(asr_env) PS C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts> python .\ws_client.py --mic --url ws://127.0.0.1:8003/ws/asr
+Traceback (most recent call last):
+  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 185, in <module>
+    asyncio.run(main())
+    ~~~~~~~~~~~^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\ws_client.py", line 149, in main
+    async with websockets.connect(args.url, max_size=None) as ws:
+               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\asr_env\Lib\site-packages\websockets\asyncio\client.py", line 590, in __aenter__
+    return await self
+           ^^^^^^^^^^
+  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\asr_env\Lib\site-packages\websockets\asyncio\client.py", line 544, in __await_impl__
+    self.connection = await self.create_connection()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts\asr_env\Lib\site-packages\websockets\asyncio\client.py", line 470, in create_connection
+    _, connection = await loop.create_connection(factory, **kwargs)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1166, in create_connection
+    raise exceptions[0]
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1141, in create_connection
+    sock = await self._connect_sock(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+        exceptions, addrinfo, laddr_infos)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\base_events.py", line 1044, in _connect_sock
+    await self.sock_connect(sock, address)
+  File "C:\Program Files\Python313\Lib\asyncio\proactor_events.py", line 726, in sock_connect
+    return await self._proactor.connect(sock, address)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 804, in _poll
+    value = callback(transferred, key, ov)
+  File "C:\Program Files\Python313\Lib\asyncio\windows_events.py", line 600, in finish_connect
+    ov.getresult()
+    ~~~~~~~~~~~~^^
+ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection
+(asr_env) PS C:\Users\re_nikitav\Desktop\cx_asr_realtime\scripts>
 
-
-
-from dataclasses import dataclass
-import os
-
-
-@dataclass
-class Config:
-    # Model
-    model_name: str = os.getenv("MODEL_NAME", "nvidia/nemotron-speech-streaming-en-0.6b")
-    device: str = os.getenv("DEVICE", "cuda")  # cuda/cpu
-    sample_rate: int = int(os.getenv("SAMPLE_RATE", "16000"))
-
-    # Streaming latency/accuracy knob (right context)
-    # 0 = ultra low latency, 1 = recommended, 6/13 = higher accuracy but more latency
-    context_right: int = int(os.getenv("CONTEXT_RIGHT", "1"))
-
-    # VAD + endpointing
-    vad_frame_ms: int = int(os.getenv("VAD_FRAME_MS", "20"))
-    vad_start_margin: float = float(os.getenv("VAD_START_MARGIN", "2.5"))
-    vad_min_noise_rms: float = float(os.getenv("VAD_MIN_NOISE_RMS", "0.003"))
-    pre_speech_ms: int = int(os.getenv("PRE_SPEECH_MS", "300"))
-
-    # Endpointing (pause triggers final)
-    end_silence_ms: int = int(os.getenv("END_SILENCE_MS", "900"))
-    min_utt_ms: int = int(os.getenv("MIN_UTT_MS", "250"))
-    max_utt_ms: int = int(os.getenv("MAX_UTT_MS", "30000"))
-
-    # When finalizing, we add extra zero padding (ms) to flush last words
-    finalize_pad_ms: int = int(os.getenv("FINALIZE_PAD_MS", "400"))
-
-    # Keep ring-buffer bounded (avoid slowdowns on long sessions)
-    max_buffer_ms: int = int(os.getenv("MAX_BUFFER_MS", "12000"))
-
-    # Concurrency
-    max_concurrent_inferences: int = int(os.getenv("MAX_CONCURRENT_INFERENCES", "1"))
-
-    # GPU metrics
-    enable_gpu_metrics: bool = os.getenv("ENABLE_GPU_METRICS", "1") == "1"
-    gpu_index: int = int(os.getenv("GPU_INDEX", "0"))
-
-    # Logging
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
-
-
-def load_config() -> Config:
-    return Config()
