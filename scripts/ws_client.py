@@ -1,92 +1,201 @@
 import asyncio
+import argparse
 import json
-import time
+import os
 import sys
+import time
+import wave
+import tempfile
+
 import numpy as np
-import sounddevice as sd
+import soundfile as sf
+import resampy
 import websockets
 
-# ================= CONFIG =================
-URL = "ws://127.0.0.1:8003/ws/asr"
-SAMPLE_RATE = 16000
-FRAME_MS = 20
-FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
+try:
+    import sounddevice as sd
+    HAS_MIC = True
+except Exception:
+    HAS_MIC = False
 
-END_SILENCE_MS = 1500
-END_SILENCE_SAMPLES = int(SAMPLE_RATE * END_SILENCE_MS / 1000)
+TARGET_SR = 16000
 
-# ================= DEBUG =================
-print("🔍 Available audio devices:")
-print(sd.query_devices())
-print("🎙 Default input device:", sd.default.device)
+# For Nemotron RNNT stability: 80–120ms chunks work well
+CHUNK_MS = 80
+CHUNK_FRAMES = int(TARGET_SR * CHUNK_MS / 1000)
+SLEEP_SEC = CHUNK_MS / 1000.0
 
-# ================= MIC STREAM =================
-async def mic_sender(ws):
+
+def resample_to_16k(wav_path: str) -> str:
+    audio, sr = sf.read(wav_path, dtype="float32")
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    if sr != TARGET_SR:
+        audio = resampy.resample(audio, sr, TARGET_SR)
+    audio = np.clip(audio, -1.0, 1.0)
+    audio = (audio * 32767).astype(np.int16)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
+    sf.write(tmp.name, audio, TARGET_SR, subtype="PCM_16")
+    return tmp.name
+
+
+async def receiver(ws):
+    """
+    Prints partials live. Prints finals + server metrics after pause.
+    """
+    finals = []
+    while True:
+        try:
+            msg = await ws.recv()
+        except websockets.exceptions.ConnectionClosed:
+            return finals
+
+        obj = json.loads(msg)
+        typ = obj.get("type")
+
+        if typ == "partial":
+            txt = obj.get("text", "").replace("\n", " ")
+            sys.stdout.write("\r[PARTIAL] " + txt[:160] + " " * 20)
+            sys.stdout.flush()
+
+        elif typ == "final":
+            txt = (obj.get("text") or "").strip()
+            print("\n[FINAL]", txt)
+            finals.append(txt)
+
+            # Print per-utterance metrics
+            print("[SERVER_METRICS]",
+                  f"reason={obj.get('reason')}",
+                  f"ttft_ms={obj.get('ttft_ms')}",
+                  f"ttf_ms={obj.get('ttf_ms')}",
+                  f"audio_ms={obj.get('audio_ms')}",
+                  f"rtf={obj.get('rtf')}",
+                  f"chunks={obj.get('chunks')}",
+                  f"preproc_ms={obj.get('model_preproc_ms')}",
+                  f"infer_ms={obj.get('model_infer_ms')}",
+                  f"flush_ms={obj.get('model_flush_ms')}",
+                  )
+    # unreachable
+
+
+async def run_wav(ws, wav_path: str, realtime: bool):
+    with wave.open(wav_path, "rb") as wf:
+        while True:
+            data = wf.readframes(CHUNK_FRAMES)
+            if not data:
+                break
+            await ws.send(data)
+            if realtime:
+                await asyncio.sleep(SLEEP_SEC)
+
+    # Let server endpoint by sending a bit of silence, then EOS
+    silence_frames = int(TARGET_SR * 0.8)
+    await ws.send(b"\x00\x00" * silence_frames)
+    await asyncio.sleep(0.8)
+    await ws.send(b"")
+
+
+async def run_mic(ws):
+    if not HAS_MIC:
+        raise RuntimeError("sounddevice not installed. Install: pip install sounddevice")
+
     loop = asyncio.get_running_loop()
-    q = asyncio.Queue()
+    q: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
 
-    def callback(indata, frames, time_info, status):
-        if status:
-            print("⚠️ MIC STATUS:", status, flush=True)
+    def cb(indata, frames, t, status):
         loop.call_soon_threadsafe(q.put_nowait, indata.copy())
 
     stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
+        samplerate=TARGET_SR,
         channels=1,
         dtype="int16",
-        blocksize=FRAME_SAMPLES,
-        callback=callback,
+        blocksize=CHUNK_FRAMES,
+        callback=cb,
     )
-
     stream.start()
-    print("🎤 MIC STREAM STARTED — SPEAK NOW", flush=True)
+
+    print("🎤 Speak freely. Pause to end sentences. Ctrl+C to exit.")
+
+    async def sender():
+        while True:
+            blk = await q.get()
+            if blk is None:
+                return
+            try:
+                await ws.send(blk.tobytes())
+            except websockets.exceptions.ConnectionClosed:
+                return
+
+    send_task = asyncio.create_task(sender())
 
     try:
         while True:
-            data = await q.get()
-            await ws.send(data.tobytes())
-    except asyncio.CancelledError:
-        print("🛑 Mic sender cancelled", flush=True)
+            await asyncio.sleep(0.25)
+    except KeyboardInterrupt:
+        pass
     finally:
         stream.stop()
         stream.close()
 
-# ================= RECEIVER =================
-async def receiver(ws):
-    async for msg in ws:
-        data = json.loads(msg)
-        if data["type"] == "partial":
-            print("\r[PARTIAL]", data["text"][:120], end="", flush=True)
+        # Send EOS so server can finalize if something is pending
+        try:
+            await ws.send(b"\x00\x00" * int(TARGET_SR * 0.8))
+            await asyncio.sleep(0.8)
+            await ws.send(b"")
+        except Exception:
+            pass
 
-        elif data["type"] == "final":
-            print("\n[FINAL]", data["text"], flush=True)
-            print("📊 METRICS:", data, flush=True)
+        await q.put(None)
+        await send_task
 
-# ================= MAIN =================
+
 async def main():
-    print("🌐 Connecting to", URL, flush=True)
+    p = argparse.ArgumentParser()
+    p.add_argument("--url", default="ws://127.0.0.1:8002/ws/asr")
+    p.add_argument("--wav", help="Path to wav file")
+    p.add_argument("--mic", action="store_true", help="Use live microphone")
+    p.add_argument("--fast", action="store_true", help="Disable realtime pacing (wav only)")
+    args = p.parse_args()
 
-    async with websockets.connect(URL, max_size=None) as ws:
-        print("✅ WebSocket connected", flush=True)
+    start = time.time()
+    t_first_final = None
+
+    async with websockets.connect(args.url, max_size=None) as ws:
+        print(f"[INFO] Connected to {args.url}")
 
         recv_task = asyncio.create_task(receiver(ws))
-        send_task = asyncio.create_task(mic_sender(ws))
 
-        print("⏳ Press ENTER to stop recording", flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
+        if args.mic:
+            await run_mic(ws)
+        else:
+            if not args.wav:
+                raise ValueError("--wav required unless --mic is set")
 
-        print("🧠 Sending silence to trigger finalization", flush=True)
+            wav = args.wav
+            cleanup = None
+            with wave.open(wav, "rb") as wf:
+                sr, ch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+            if sr != TARGET_SR or ch != 1 or sw != 2:
+                print(f"[INFO] Resampling WAV → 16kHz mono PCM16 (src={sr}Hz ch={ch} sw={sw})")
+                wav = resample_to_16k(wav)
+                cleanup = wav
 
-        await ws.send(b"\x00\x00" * END_SILENCE_SAMPLES)
-        await asyncio.sleep(END_SILENCE_MS / 1000)
-        await ws.send(b"")
+            await run_wav(ws, wav, realtime=not args.fast)
 
-        send_task.cancel()
-        await recv_task
+            if cleanup:
+                os.unlink(cleanup)
 
-# ================= ENTRY =================
+        finals = await recv_task
+
+    total = time.time() - start
+    print("\nFULL TRANSCRIPT:")
+    print(" ".join([t for t in finals if t.strip()]))
+
+    print("\nCLIENT METRICS:")
+    print(f"Total wall time: {total:.2f}s")
+
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Exiting cleanly")
+    asyncio.run(main())
