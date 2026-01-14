@@ -101,3 +101,16 @@ MAX_BUFFER_MS=12000
 ---
 
 This setup provides **production-grade realtime ASR with accurate metrics**.
+
+Hi Kunal,
+
+Quick update on the Nemotron real-time ASR work:
+- Real-time transcription is now working smoothly with live partials + accurate final transcripts.
+- Latency metrics are now correctly emitted per utterance (no need to scrape /metrics).
+- Latest benchmark from mic input:
+      - TTFT (first partial): ~517 ms
+      - Final transcript delay after pause: ~35 ms
+      - RTF: ~0.25 (≈ 4× faster than real-time)
+      - Preproc ≈ 466 ms, Inference ≈ 1.9 s, Flush ≈ 40 ms for ~7.6 s audio
+
+Streaming stability issues (broken sentences / missing words) are resolved.
