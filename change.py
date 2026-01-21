@@ -205,12 +205,6 @@ async def ws_asr(ws: WebSocket):
                 await finalize_and_emit("receive_error")
                 break
 
-            log.info(
-                f"WS frame type={msg.get('type')} "
-                f"has_bytes={msg.get('bytes') is not None} "
-                f"has_text={msg.get('text') is not None}"
-            )
-
             mtype = msg.get("type")
             if mtype == "websocket.disconnect":
                 ws_open = False
