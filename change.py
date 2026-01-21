@@ -307,3 +307,12 @@ async def ws_asr(ws: WebSocket):
                 pass
 
         log.info("WS disconnected")
+
+
+docker run --gpus all \
+  -p 8003:8080 \
+  -e ENABLE_AUDIO_DUMP=1 \
+  -e DEBUG_AUDIO_DIR=/srv/debug_audio \
+  -v $(pwd)/debug_audio:/srv/debug_audio \
+  cx_asr_realtime
+
