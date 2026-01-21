@@ -1,3 +1,9 @@
+swapping model_name in config.py
+
+pointing it to:
+
+openai/whisper-large-v3-turbo
+
 Nemotron streaming works well because it uses a native streaming architecture, not because of the model name alone.
 
 Simply replacing the model name in the Nemotron config with Whisper Turbo or Riva 1B does not work and does not fix buffer or latency issues.
