@@ -1,10 +1,13 @@
+# app/main.py  ✅ COMPLETE FIXED VERSION (ASGI send-after-close + TS debug logs + server-side transcript logs)
+
 import json
 import time
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
+from fastapi.websockets import WebSocketDisconnect
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from app.config import load_config
@@ -33,6 +36,12 @@ async def startup():
     log.info(f"Loaded model={cfg.model_name} in {load_sec:.2f}s on {cfg.device}")
 
 
+@app.get("/health")
+async def health():
+    # Useful for browser/TS debugging (network/port/proxy check)
+    return {"ok": True}
+
+
 @app.get("/metrics")
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -42,11 +51,13 @@ async def metrics():
 async def ws_asr(ws: WebSocket):
     """
     ✅ FIXES:
-    - Never ws.send_text after disconnect/close
-    - Guard sends with ws_open flag
-    - Catch WebSocketDisconnect and RuntimeError on send
+    - Never ws.send_text after disconnect/close (prevents ASGI RuntimeError)
+    - Guard sends with ws_open flag + safe_send_text()
+    - Catch WebSocketDisconnect / RuntimeError on send
     - Close only if still open
-    - Add try/catch around accept + receive for TS client debugging
+    - Try/catch around accept + receive for TS client debugging
+    - Server-side transcript logging (FINAL at INFO, PARTIAL at DEBUG)
+    - Logs incoming frame shape: bytes vs text (critical for TS)
     """
     assert engine is not None
 
@@ -99,10 +110,12 @@ async def ws_asr(ws: WebSocket):
         nonlocal ws_open
         if not ws_open:
             return False
+
         try:
             await ws.send_text(payload)
             return True
         except (WebSocketDisconnect, RuntimeError) as e:
+            # This includes: "Unexpected ASGI message 'websocket.send' after websocket.close"
             ws_open = False
             log.warning(f"WS send failed (closed): {e}")
             return False
@@ -114,9 +127,9 @@ async def ws_asr(ws: WebSocket):
     async def finalize_and_emit(reason: str):
         """
         ✅ IMPORTANT FIX:
-        - Never send after ws closed
         - Snapshot stats BEFORE finalize() resets them
-        - Wrap send in safe_send_text()
+        - Never crash if WS already closed (safe_send_text)
+        - Server-side FINAL transcript log
         """
         nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
 
@@ -128,7 +141,6 @@ async def ws_asr(ws: WebSocket):
         snap_preproc = float(getattr(session, "utt_preproc", 0.0))
         snap_infer = float(getattr(session, "utt_infer", 0.0))
 
-        # flush wall time here (since utt_flush gets reset too)
         flush_t0 = time.perf_counter()
         final = session.finalize(cfg.finalize_pad_ms).strip()
         flush_wall = time.perf_counter() - flush_t0
@@ -170,9 +182,15 @@ async def ws_asr(ws: WebSocket):
             "flush_ms": int(flush_wall * 1000),
         }
 
+        # ✅ server-side FINAL transcript log
+        log.info(
+            f"[ASR][FINAL] reason={reason} audio_ms={utt_audio_ms} "
+            f"ttft_ms={payload['ttft_ms']} ttf_ms={payload['ttf_ms']} rtf={rtf} "
+            f"text='{final}'"
+        )
+
         await safe_send_text(json.dumps(payload))
 
-        # reset for next utterance
         reset_utt_state()
 
     try:
@@ -189,15 +207,15 @@ async def ws_asr(ws: WebSocket):
                 ws_open = False
                 await finalize_and_emit("receive_error")
                 break
+
+            # ✅ client frame shape log (bytes vs text)
             log.info(
                 f"WS frame type={msg.get('type')} "
                 f"has_bytes={msg.get('bytes') is not None} "
                 f"has_text={msg.get('text') is not None}"
             )
 
-
             mtype = msg.get("type")
-            # log.debug(f"WS msg type: {mtype}")  # enable if LOG_LEVEL=DEBUG
 
             if mtype == "websocket.disconnect":
                 ws_open = False
@@ -215,7 +233,7 @@ async def ws_asr(ws: WebSocket):
 
             # EOS from client
             if pcm == b"":
-                ws_open = False  # client intends to close; do not send after close race
+                ws_open = False  # client intends to close; avoid post-close sends
                 await finalize_and_emit("eos")
                 break
 
@@ -254,9 +272,12 @@ async def ws_asr(ws: WebSocket):
                         t_first_partial = time.time()
 
                     PARTIALS_TOTAL.inc()
+
+                    # ✅ server-side PARTIAL transcript log (DEBUG only; can be noisy)
+                    log.debug(f"[ASR][PARTIAL] {text}")
+
                     ok = await safe_send_text(json.dumps({"type": "partial", "text": text}))
                     if not ok:
-                        # client gone; stop work
                         ws_open = False
                         break
 
@@ -288,20 +309,3 @@ async def ws_asr(ws: WebSocket):
                 pass
 
         log.info("WS disconnected")
-
-
-{
-  "type": "config",
-  "audio": {
-    "sample_rate": 16000,
-    "frame_ms": 20,
-    "channels": 1,
-    "format": "pcm16"
-  },
-  "client": {
-    "name": "web-ts",
-    "realtime": true
-  }
-}
-
-
