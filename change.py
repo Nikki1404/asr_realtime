@@ -306,12 +306,15 @@ async def ws_asr(ws: WebSocket):
 
 
 
-docker run --gpus all \
-  -p 8003:8080 \
+docker run -d --gpus all \
+  -p 4000:8003 \
   -e ENABLE_AUDIO_DUMP=1 \
   -e DEBUG_AUDIO_DIR=/srv/debug_audio \
   -v $(pwd)/debug_audio:/srv/debug_audio \
-  cx_asr_realtime
+
+Issue is with the sample rate of the chunk which is 8k, 
+and backend required is 16k, can we up sample the sample rate for the chunk and then send it as input to the Nemotron, which will work.
+  cx_asr_realtime_nemotron
 
 
     enable_audio_dump: bool = os.getenv("ENABLE_AUDIO_DUMP", "0") == "1"
