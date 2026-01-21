@@ -291,15 +291,21 @@ async def ws_asr(ws: WebSocket):
         log.info(f"WS disconnected session={session_id}")
 
 
-Since the audio is streamed as raw PCM binary frames over WebSocket and does not carry any metadata such as sample rate, the server cannot infer it automatically. Therefore, the client sends the sample rate explicitly in an initial start message. The server already includes resampling logic to upsample 8 kHz audio to the required 16 kHz before passing it to the ASR engine.
-Since audio is streamed as raw PCM binary frames, the server cannot detect the sample rate automatically.
-So Node.js must send a one-time metadata message before audio streaming starts.
-
-Initial “start” message (Node.js → Server)
-ws.send(JSON.stringify({
+do we need to send only this or both? Can you confirm?
+for start -> ws.send(JSON.stringify({
   type: "start",
   sample_rate: 8000   // or 16000 if already 16k
 }));
-
-
-This must be sent once per WebSocket connection, before sending any audio bytes.
+for config -> {
+      "type": "config",
+      "audio": {
+        "sample_rate": 8000,
+        "frame_ms": 20,
+        "channels": 1,
+        "format": "pcm16"
+      },
+      "client": {
+        "name": "web-ts",
+        "realtime": true
+      }
+    }
