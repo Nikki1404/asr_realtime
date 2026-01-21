@@ -148,7 +148,10 @@ async def main():
 
     async with websockets.connect(args.url, max_size=None) as ws:
         print(f"[INFO] Connected to {args.url}")
-
+        await ws.send(json.dumps({
+            "type": "start",
+            "sample_rate": TARGET_SR
+        }))
         recv_task = asyncio.create_task(receiver(ws))
 
         if args.mic:
