@@ -313,3 +313,6 @@ docker run --gpus all \
   -v $(pwd)/debug_audio:/srv/debug_audio \
   cx_asr_realtime
 
+
+    enable_audio_dump: bool = os.getenv("ENABLE_AUDIO_DUMP", "0") == "1"
+    debug_audio_dir: str = os.getenv("DEBUG_AUDIO_DIR", "./debug_audio")
