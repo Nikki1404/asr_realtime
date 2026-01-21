@@ -289,3 +289,6 @@ async def ws_asr(ws: WebSocket):
             except Exception:
                 pass
         log.info(f"WS disconnected session={session_id}")
+
+
+Since the audio is streamed as raw PCM binary frames over WebSocket and does not carry any metadata such as sample rate, the server cannot infer it automatically. Therefore, the client sends the sample rate explicitly in an initial start message. The server already includes resampling logic to upsample 8 kHz audio to the required 16 kHz before passing it to the ASR engine.
