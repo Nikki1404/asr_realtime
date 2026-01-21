@@ -2,8 +2,6 @@ import json
 import time
 import logging
 from typing import Optional
-
-# 🔴 ADDED
 import os
 import wave
 import uuid
@@ -53,7 +51,6 @@ async def metrics():
 async def ws_asr(ws: WebSocket):
     assert engine is not None
 
-    # 🔴 ADDED: unique session id
     session_id = uuid.uuid4().hex[:8]
 
     ws_open = False
@@ -86,8 +83,6 @@ async def ws_asr(ws: WebSocket):
 
     frame_bytes = int(cfg.sample_rate * (cfg.vad_frame_ms / 1000.0) * 2)
     pcm_buffer = bytearray()
-
-    # 🔴 ADDED: raw PCM accumulator
     received_pcm = bytearray()
 
     def reset_utt_state():
@@ -114,8 +109,7 @@ async def ws_asr(ws: WebSocket):
             ws_open = False
             log.warning(f"WS send failed (unknown): {e}")
             return False
-
-    # 🔴 ADDED: WAV dump helper
+            
     def dump_received_audio():
         if not received_pcm:
             return
@@ -151,7 +145,6 @@ async def ws_asr(ws: WebSocket):
         final = session.finalize(cfg.finalize_pad_ms).strip()
         flush_wall = time.perf_counter() - flush_t0
 
-        # 🔴 ADDED: dump received PCM as WAV
         dump_received_audio()
 
         UTTERANCES_TOTAL.inc()
@@ -232,7 +225,6 @@ async def ws_asr(ws: WebSocket):
                     log.warning(f"Received text frame (expected bytes): {txt[:200]}")
                 continue
 
-            # 🔴 ADDED: accumulate exact PCM bytes
             if pcm:
                 received_pcm.extend(pcm)
 
