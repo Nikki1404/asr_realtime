@@ -1,5 +1,3 @@
-# app/main.py  ✅ COMPLETE FIXED VERSION (ASGI send-after-close + TS debug logs + server-side transcript logs)
-
 import json
 import time
 import logging
