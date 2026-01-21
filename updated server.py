@@ -5,7 +5,10 @@ from typing import Optional
 import os
 import wave
 import uuid
+
+# ADDED
 import numpy as np
+import resampy
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
@@ -31,7 +34,7 @@ async def startup():
     engine = NemotronStreamingASR(
         model_name=cfg.model_name,
         device=cfg.device,
-        sample_rate=cfg.sample_rate,   # 16k
+        sample_rate=cfg.sample_rate,
         context_right=cfg.context_right,
     )
     load_sec = engine.load()
@@ -54,14 +57,10 @@ async def ws_asr(ws: WebSocket):
 
     session_id = uuid.uuid4().hex[:8]
 
-    # 🔑 Input SR from client (NodeJS = 8000, Python = 16000)
-    INPUT_SAMPLE_RATE = int(os.getenv("INPUT_SAMPLE_RATE", "16000"))
-    TARGET_SAMPLE_RATE = cfg.sample_rate  # 16000
-
-    if INPUT_SAMPLE_RATE not in (8000, 16000):
-        log.warning(f"[ASR][{session_id}] Unsupported INPUT_SAMPLE_RATE={INPUT_SAMPLE_RATE}")
-
     ws_open = False
+
+    # ADDED: per-connection sample rate (default = 16k)
+    client_sample_rate = cfg.sample_rate
 
     try:
         await ws.accept()
@@ -71,10 +70,7 @@ async def ws_asr(ws: WebSocket):
         return
 
     ACTIVE_STREAMS.inc()
-    log.info(
-        f"WS connected: {ws.client} session={session_id} "
-        f"input_sr={INPUT_SAMPLE_RATE} target_sr={TARGET_SAMPLE_RATE}"
-    )
+    log.info(f"WS connected: {ws.client} session={session_id}")
 
     vad = AdaptiveEnergyVAD(
         cfg.sample_rate,
@@ -112,11 +108,13 @@ async def ws_asr(ws: WebSocket):
         try:
             await ws.send_text(payload)
             return True
-        except (WebSocketDisconnect, RuntimeError):
+        except (WebSocketDisconnect, RuntimeError) as e:
             ws_open = False
+            log.warning(f"WS send failed (closed): {e}")
             return False
-        except Exception:
+        except Exception as e:
             ws_open = False
+            log.warning(f"WS send failed (unknown): {e}")
             return False
 
     def dump_received_audio():
@@ -140,23 +138,73 @@ async def ws_asr(ws: WebSocket):
         log.info(f"[ASR][DEBUG][{session_id}] WAV dumped → {wav_path}")
         received_pcm.clear()
 
+    # ADDED: upsample helper (only used if client is 8k)
+    def upsample_if_needed(pcm: bytes) -> bytes:
+        if not pcm or client_sample_rate == cfg.sample_rate:
+            return pcm
+
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        y = resampy.resample(x, client_sample_rate, cfg.sample_rate)
+        y = np.clip(y, -1.0, 1.0)
+        return (y * 32767.0).astype(np.int16).tobytes()
+
     async def finalize_and_emit(reason: str):
         nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
 
         if not utt_started:
             return
 
+        snap_chunks = int(getattr(session, "chunks", 0))
+        snap_preproc = float(getattr(session, "utt_preproc", 0.0))
+        snap_infer = float(getattr(session, "utt_infer", 0.0))
+
+        flush_t0 = time.perf_counter()
         final = session.finalize(cfg.finalize_pad_ms).strip()
+        flush_wall = time.perf_counter() - flush_t0
+
         dump_received_audio()
+
+        UTTERANCES_TOTAL.inc()
+        FINALS_TOTAL.inc()
+
+        now = time.time()
+        ttf_sec = (now - t_start) if t_start else 0.0
+        TTF_WALL.observe(ttf_sec)
+
+        if t_first_partial and t_start:
+            TTFT_WALL.observe(t_first_partial - t_start)
+
+        audio_sec = utt_audio_ms / 1000.0
+        AUDIO_SEC.observe(audio_sec)
+
+        PREPROC_SEC.observe(snap_preproc)
+        INFER_SEC.observe(snap_infer)
+        FLUSH_SEC.observe(flush_wall)
+
+        rtf = None
+        if audio_sec > 0:
+            rtf = snap_infer / audio_sec
+            RTF.observe(rtf)
 
         payload = {
             "type": "final",
             "text": final,
             "reason": reason,
             "audio_ms": utt_audio_ms,
+            "ttft_ms": int((t_first_partial - t_start) * 1000) if (t_first_partial and t_start) else None,
+            "ttf_ms": int(ttf_sec * 1000),
+            "rtf": rtf,
+            "chunks": snap_chunks,
+            "preproc_ms": int(snap_preproc * 1000),
+            "infer_ms": int(snap_infer * 1000),
+            "flush_ms": int(flush_wall * 1000),
         }
 
-        log.info(f"[ASR][FINAL][{session_id}] {final}")
+        log.info(
+            f"[ASR][FINAL][{session_id}] reason={reason} audio_ms={utt_audio_ms} "
+            f"text='{final}'"
+        )
+
         await safe_send_text(json.dumps(payload))
         reset_utt_state()
 
@@ -168,21 +216,31 @@ async def ws_asr(ws: WebSocket):
                 ws_open = False
                 await finalize_and_emit("disconnect")
                 break
+            except Exception as e:
+                log.error(f"WS receive failed: {e}")
+                ws_open = False
+                await finalize_and_emit("receive_error")
+                break
+
+            # ADDED: handshake parser
+            if msg.get("text"):
+                try:
+                    meta = json.loads(msg["text"])
+                    if meta.get("type") == "start" and "sample_rate" in meta:
+                        client_sample_rate = int(meta["sample_rate"])
+                        log.info(
+                            f"[ASR][{session_id}] Client sample rate set to {client_sample_rate}Hz"
+                        )
+                        continue
+                except Exception:
+                    pass
 
             pcm = msg.get("bytes")
 
             if pcm is None:
                 continue
 
-            # ===============================
-            # 🔑 UPSAMPLING LOGIC (SAFE)
-            # ===============================
-            if INPUT_SAMPLE_RATE == 8000 and pcm:
-                # int16 → duplicate samples → int16
-                x = np.frombuffer(pcm, dtype=np.int16)
-                x = np.repeat(x, 2)
-                pcm = x.tobytes()
-            # If 16k → untouched
+            pcm = upsample_if_needed(pcm)
 
             if pcm:
                 received_pcm.extend(pcm)
@@ -209,6 +267,7 @@ async def ws_asr(ws: WebSocket):
                     utt_started = True
                     utt_audio_ms = 0
                     t_start = time.time()
+                    t_first_partial = None
                     session.accept_pcm16(pre)
 
                 if not utt_started:
@@ -219,7 +278,16 @@ async def ws_asr(ws: WebSocket):
 
                 text = session.step_if_ready()
                 if text:
-                    await safe_send_text(json.dumps({"type": "partial", "text": text}))
+                    if t_first_partial is None:
+                        t_first_partial = time.time()
+
+                    PARTIALS_TOTAL.inc()
+                    log.debug(f"[ASR][PARTIAL][{session_id}] {text}")
+
+                    ok = await safe_send_text(json.dumps({"type": "partial", "text": text}))
+                    if not ok:
+                        ws_open = False
+                        break
 
                 should_finalize = (
                     silence_ms >= cfg.end_silence_ms
@@ -230,7 +298,8 @@ async def ws_asr(ws: WebSocket):
                     should_finalize = True
 
                 if should_finalize:
-                    await finalize_and_emit("pause")
+                    reason = "pause" if silence_ms >= cfg.end_silence_ms else "max_utt"
+                    await finalize_and_emit(reason)
 
             if not ws_open:
                 break
