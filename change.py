@@ -8,6 +8,10 @@ import os
 import wave
 import uuid
 
+#  ADDED (server-side upsampling)
+import numpy as np
+import resampy
+
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
 from fastapi.websockets import WebSocketDisconnect
@@ -56,6 +60,14 @@ async def ws_asr(ws: WebSocket):
     #  ADDED: unique session id
     session_id = uuid.uuid4().hex[:8]
 
+    #  ADDED (assumed NodeJS input SR)
+    INPUT_SAMPLE_RATE = int(os.getenv("INPUT_SAMPLE_RATE", "8000"))
+    TARGET_SAMPLE_RATE = int(cfg.sample_rate)
+
+    #  ADDED: one-time log so you know server is resampling
+    if INPUT_SAMPLE_RATE != TARGET_SAMPLE_RATE:
+        log.info(f"[ASR][{session_id}] Resampling enabled: {INPUT_SAMPLE_RATE}Hz → {TARGET_SAMPLE_RATE}Hz")
+
     ws_open = False
 
     try:
@@ -90,6 +102,56 @@ async def ws_asr(ws: WebSocket):
     #  ADDED: raw PCM accumulator
     received_pcm = bytearray()
 
+    #  ADDED: 8k→16k resampler state (handles arbitrary chunk sizes cleanly)
+    _rs_in = np.array([], dtype=np.float32)
+    _rs_pos = 0.0
+    _rs_ratio = (TARGET_SAMPLE_RATE / float(INPUT_SAMPLE_RATE)) if INPUT_SAMPLE_RATE > 0 else 2.0
+
+    def _resample_pcm16_stream(pcm_bytes: bytes) -> bytes:
+        """
+        Streaming-ish resample:
+        - accumulates float32 input
+        - emits int16 output
+        - preserves phase across packets using _rs_pos
+        """
+        nonlocal _rs_in, _rs_pos, _rs_ratio
+
+        if not pcm_bytes:
+            return b""
+
+        if INPUT_SAMPLE_RATE == TARGET_SAMPLE_RATE:
+            return pcm_bytes
+
+        x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if x.size == 0:
+            return b""
+
+        # append new samples
+        _rs_in = np.concatenate([_rs_in, x])
+
+        # determine how many output samples we can safely emit
+        out_count = int((len(_rs_in) - _rs_pos) * _rs_ratio)
+        if out_count <= 0:
+            return b""
+
+        # positions in input for each output sample (linear interpolation)
+        idx = _rs_pos + (np.arange(out_count, dtype=np.float32) / _rs_ratio)
+        i0 = np.floor(idx).astype(np.int64)
+        frac = idx - i0
+        i1 = np.minimum(i0 + 1, len(_rs_in) - 1)
+
+        y = (1.0 - frac) * _rs_in[i0] + frac * _rs_in[i1]
+
+        # advance position; drop consumed input to keep buffer bounded
+        _rs_pos = idx[-1] + (1.0 / _rs_ratio)
+        drop = int(_rs_pos) - 8  # keep a tiny tail for interpolation safety
+        if drop > 0:
+            _rs_in = _rs_in[drop:]
+            _rs_pos -= drop
+
+        y = np.clip(y, -1.0, 1.0)
+        return (y * 32767.0).astype(np.int16).tobytes()
+
     def reset_utt_state():
         nonlocal utt_started, utt_audio_ms, t_start, t_first_partial, silence_ms
         vad.reset()
@@ -98,6 +160,11 @@ async def ws_asr(ws: WebSocket):
         t_start = None
         t_first_partial = None
         silence_ms = 0
+
+        #  ADDED: also reset resampler buffers at utterance boundary
+        nonlocal _rs_in, _rs_pos
+        _rs_in = np.array([], dtype=np.float32)
+        _rs_pos = 0.0
 
     async def safe_send_text(payload: str) -> bool:
         nonlocal ws_open
@@ -118,6 +185,11 @@ async def ws_asr(ws: WebSocket):
     #  ADDED: WAV dump helper
     def dump_received_audio():
         if not received_pcm:
+            return
+
+        # gate by config if present; default OFF unless cfg.enable_audio_dump exists and is True
+        if hasattr(cfg, "enable_audio_dump") and not getattr(cfg, "enable_audio_dump", False):
+            received_pcm.clear()
             return
 
         debug_dir = getattr(cfg, "debug_audio_dir", "./debug_audio")
@@ -151,7 +223,7 @@ async def ws_asr(ws: WebSocket):
         final = session.finalize(cfg.finalize_pad_ms).strip()
         flush_wall = time.perf_counter() - flush_t0
 
-        #  ADDED: dump received PCM as WAV
+        #  ADDED: dump received PCM as WAV (this is 16k after resampling)
         dump_received_audio()
 
         UTTERANCES_TOTAL.inc()
@@ -232,7 +304,11 @@ async def ws_asr(ws: WebSocket):
                     log.warning(f"Received text frame (expected bytes): {txt[:200]}")
                 continue
 
-            #  ADDED: accumulate exact PCM bytes
+            #  ADDED: upsample 8k PCM → 16k PCM BEFORE any downstream processing
+            if pcm:
+                pcm = _resample_pcm16_stream(pcm)
+
+            #  ADDED: accumulate exact PCM bytes (after resampling → 16k)
             if pcm:
                 received_pcm.extend(pcm)
 
@@ -306,16 +382,11 @@ async def ws_asr(ws: WebSocket):
 
 
 
+
 docker run -d --gpus all \
   -p 4000:8003 \
   -e ENABLE_AUDIO_DUMP=1 \
   -e DEBUG_AUDIO_DIR=/srv/debug_audio \
   -v $(pwd)/debug_audio:/srv/debug_audio \
-
-Issue is with the sample rate of the chunk which is 8k, 
-and backend required is 16k, can we up sample the sample rate for the chunk and then send it as input to the Nemotron, which will work.
   cx_asr_realtime_nemotron
 
-
-    enable_audio_dump: bool = os.getenv("ENABLE_AUDIO_DUMP", "0") == "1"
-    debug_audio_dir: str = os.getenv("DEBUG_AUDIO_DIR", "./debug_audio")
