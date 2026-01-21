@@ -288,3 +288,20 @@ async def ws_asr(ws: WebSocket):
                 pass
 
         log.info("WS disconnected")
+
+
+{
+  "type": "config",
+  "audio": {
+    "sample_rate": 16000,
+    "frame_ms": 20,
+    "channels": 1,
+    "format": "pcm16"
+  },
+  "client": {
+    "name": "web-ts",
+    "realtime": true
+  }
+}
+
+
